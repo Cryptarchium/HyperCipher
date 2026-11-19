@@ -124,7 +124,7 @@ keyed HMAC-SHA512 tag ile yapılır (sabit string kontrolünden güçlüdür).
 - 2048-bit anahtar uzayı: **2^2048 ≈ 3.2×10^616** olasılık
 - Dünyadaki tüm bilgisayarlar birleşse bile ulaşılamayacak hız olan
   saniyede 10^30 deneme ile bile: **~10^579 yıl**
-- Bir googol = 10^100 yıl. Yani senin tahminin bile mütevazıydı. 😄
+- Bir googol = 10^100 yıl. Bu... bildiğin onun akılalmaz büyüklüğünde
 - Karşılaştırma: AES-256 = 2^256 ≈ 1.16×10^77 deneme
   → HyperCipher'in anahtar uzayı AES-256'dan **10^539 kat** büyük
 
