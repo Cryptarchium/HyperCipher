@@ -1,4 +1,4 @@
-# HYPERCIPHER v5
+# HYPERCIPHER v5 (NOT FINISHED)
 
 **2048-bit, donanıma bağlı, rotasyonlu stream cipher**
 
