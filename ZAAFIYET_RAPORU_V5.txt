@@ -1,0 +1,760 @@
+================================================================================
+HYPERCIPHER v5 - FULL CODEBASE GUVENLIK TARAMASI (V5)
+================================================================================
+Tarih    : 2026-08-13
+Kapsam   : hyper_cipher.py (2040 satir) + hcli.py (556) + test_hyper_cipher.py
+           (1060) + test_hcli.py (568) + test_professional.py (499) + ststests.py
+           (352) + demo.py (87) + _demo_weak_pw.py (54) + calibrate.py (44)
+           + ornekler/ (4 dosya) + diceware_words.txt (7776 satir)
+Yontem   : Tek basina (agentsiz) tam kaynak taramasi. Tehlikeli desen taramasi
+           (eval/exec/pickle/marshal/os.system/shell/subprocess) + kripto
+           cercevesi analizi (nonce, keystream, subkey zinciri, KDF, HMAC) +
+           dosya I/O analizi (ACL, symlink, TOCTOU, tmp) + CLI akis analizi.
+Kanit    : python -m pytest -q --no-header  ->  177 passed, 2 skipped (38.6s)
+           Mevcut test suiti yesil.
+
+SONUC: ISTISMAR EDILEBILIR GUVENLIK ACIĞI BULUNAMADI (0 adet).
+       10 gozlem kaydedildi (1 DUSUK seviye, 9 BILGI seviyesi) -
+       hicbiri saldirgan tarafindan istismar edilebilir degildir.
+       Onaylanan guclendirme envanteri rapor sonundadir.
+
+--------------------------------------------------------------------------------
+BULGU 1 [DUSUK]  _encrypt_deterministic / _encrypt_file_deterministic
+                 modul seviyesinde iceri aktarilabilir (nonce-reuse footgun)
+Konum : hyper_cipher.py:743-757 ve 887-901
+Detay : Bu fonksiyonlar PUBLIC API degildir (docstring: "SADECE ic/test API")
+        AMA modul seviyesinde tanimlidirlar -> kutuphane kullanicisi
+        hc._encrypt_deterministic(data, pw, salt=S, nonce=N) cagirabilir.
+        Ayni (salt, nonce) ikilisiyle iki farkli mesaj sifrelenirse keystream
+        AYNEN tekrar eder -> plaintext XOR sizintisi (stream cipher klasik
+        hatasi). encrypt()/encrypt_file() her cagri icin CSPRNG uretir
+        (os.urandom) ve API sabit nonce kabul etmez - bu yalnizca bilincli
+        kullanici hatasi senaryosudur.
+Etki   : Kullanici bu icine API'yi yanlis kullanirsa gizlilik kaybi.
+         CLI/ana akis etkilenmez (oradan erisilemez).
+Durum  : FIXLENDI (V5.3, 2026-08-13) - FAIL-CLOSED GUARD:
+         - _DETERMINISTIC_MODE=False modul bayragi (varsayilan).
+         - _encrypt_deterministic / _encrypt_file_deterministic bayrak kapali
+           iken RuntimeError firlatir. Tink felsefesi: nonce-misuse'a
+           duyarsiz olmayan modu KULLANICIYA ACIK birakma.
+         - Gercek islem mantigi _encrypt_core / _encrypt_file_core ic
+           core'larina tasindi (public encrypt()/encrypt_file() bunlari
+           CSPRNG salt/nonce ile cagirir - public yol hicbir kod duplikasyonu
+           olmadan, guard'siz calisir).
+         - Opt-in yalnizca test ortaminda: conftest.py (pytest) + test
+           dosyalari basi (python -m unittest icin conftest yuklenmez).
+           Uretim kodu / hcli.py bayraga DOKUNMAZ.
+         - Testler: TestV5Guards (2 guard + 1 fp-NUL) test_hyper_cipher.py.
+         - RED->GREEN: 3 yeni test once fail (guard yoktu), fix sonrasi gecti.
+         - Kanit: 180 passed, 2 skipped (pytest) / 182 OK, 2 skipped
+           (python -m unittest); pyright 0; selftest OK; demo OK.
+
+--------------------------------------------------------------------------------
+BULGU 2 [BILGI]  _derive_master: passphrase ile fp tek 0x00 baytiyla ayriliyor
+Konum : hyper_cipher.py:347-348  (material.append(0); material.extend(fp_blob))
+Detay : Uzunluk-on-ekli ayrac yerine tek NUL ayrac. Teorik olarak pw sonunda
+        0x00 ve fp basinda 0x00 olan farkli (pw, fp) ciftleri ayni material
+        uretebilirdi. PRATIKTE IMKANSIZ: fp_blob her zaman ASCII etiketle
+        baslar ("mguid:", "mac:", "vol:", "proc:", "node:" veya bos) - asla
+        0x00 ile baslamaz; use_hardware=False'te fp bos ve uzunluk farki
+        collaision'i zaten onler.
+Etki   : Yok (teorik domain-separation notu). Gelecekte fp formati degisirse
+         gozden gecirilmeli.
+Durum  : FIXLENDI (V5.3) - _derive_master icinde fp_blob NUL byte iceriyorsa
+         ValueError (fail-closed). Encoding pw||0x00||fp artik KANITLANABILIR
+         injective (ayrac yalnizca son NUL olabilir; NIST SP 800-108r1 context
+         encoding ilkesi). Canli fp (ASCII etiketli) NUL uretmedigi icin
+         davranis DEGISMEDI - KDF girdisi birebir ayni (eski paketler acilir).
+         Test: TestV5Guards.test_fp_nul_byte_reddedilir (RED->GREEN).
+
+--------------------------------------------------------------------------------
+BULGU 3 [BILGI]  GetVolumeInformationW ctypes imzasi tanimsiz
+Konum : hyper_cipher.py:240-246
+Detay : Diger tum WinAPI cagrilari titizlikle argtypes/restype tanimli iken
+        bu cagri ctypes.windll ile yapilmis (varsayilan c_int restype; BOOL
+        dondurur, truncation riski YOK; serial c_uint32 ile dolduruluyor).
+Etki   : Yok (kosmetik tutarlilik notu). argtypes eklemek istege bagli.
+Durum  : FIXLENDI (V5.3) - ctypes.windll (bellekten derlenmis, imzasiz)
+         yerine acik WinDLL("kernel32", use_last_error=True) + tam
+         argtypes/restype (BOOL restype; lpRootPathName c_wchar_p,
+         nVolumeNameSize c_uint32, serial POINTER(c_uint32), fs_name
+         c_wchar_p). Yanlis imza artik calisma aninda reddedilir.
+
+--------------------------------------------------------------------------------
+BULGU 4 [BILGI]  HYPERCIPHER_MAX_KDF_N env'i her parse_header'da yeniden okunur
+Konum : hyper_cipher.py:136 (cagrilar: 535, 639)
+Detay : _effective_max_kdf_n() her KDF oncesi os.environ'i okur. Env yerel
+        surece aittir - saldirgan paketle degistiremez. Gecersiz env fail-closed
+        (ValueError). Yalnizca daraltabilir (genisletemez - DENETIM 5 [9]).
+Etki   : Yok. Minik performans notu (tek env okuma).
+Durum  : FIXLENDI (V5.3) - docstring'e bilincli tasarim aciklamasi eklendi
+         (butce degisikligi aninda uygulanir; env okuma maliyeti Argon2id'in
+         yaninda ihmal edilir; fail-closed zaten). Davranis DEGISMEDI.
+
+--------------------------------------------------------------------------------
+BULGU 5 [BILGI]  wipe() CPython immutable kopyalarini temizleyemez
+Konum : hyper_cipher.py:653-663
+Detay : bytearray'ler sifirlanir ama normalize/encode ara kopyalari (str,
+        bytes) ve Argon2id cikti kopyalari silinemez. Docstring'de "yapilabilecek
+        en guclu sey" olarak kabul edilmis - tum mutable kopyalar wipe ediliyor.
+Etki   : Heap dump senaryosunda kismi kalinti mumkun (bilinen Python siniri).
+Durum  : FIXLENDI (V5.3) - wipe() docstring'i kapsamli aciklama ile
+         guncellendi (immutable kopyalar interpreter siniridir; tum mutable
+         kopyalar wipe ediliyor - yapilabilecek en guclu pratik). Kod
+         degisikligi YOK (zaten dogru).
+
+--------------------------------------------------------------------------------
+BULGU 6 [BILGI]  keyfile, HKDF salt'i olarak kullaniliyor
+Konum : hyper_cipher.py:336 (pre = _hkdf(pw_bytes, salt=keyfile, ...))
+Detay : RFC 5869 salt'in "gizli olmasi gerekmez" der; burada salt ikinci
+        faktor olarak GIZLI kabul edilir. age/sympa modeliyle birebir ayni
+        desen; HMAC(salt, ikm) extract gizli salt ile anahtarlandigi icin
+        kriptografik olarak saglam. Zayif perde + gizli keyfile -> PRK
+        keyfile entropisiyle korunur.
+Etki   : Yok. Kabul edilmis ve belgelenmis desen.
+Durum  : DEĞERLENDIRILDI (V5.3) - degisiklik GEREKMEDI. age/sympa ile birebir
+         ayni model; gizli salt anahtarli HMAC extract'i kriptografik olarak
+         saglam. KDF girdisini degistirmek eski paketleri kirardi.
+
+--------------------------------------------------------------------------------
+BULGU 7 [BILGI]  cmd_decrypt kf_flag icin dosyayi iki kez acar
+Konum : hcli.py:299-304 (once header okunur) + decrypt_file (tekrar acar)
+Detay : kf_flag yalnizca UYARI karari icindir; yetkili dogrulama
+        decrypt_file'in kendi parse_header'inda yapilir. Iki okuma arasinda
+         dosya degisse bile decrypt_file kendi header'ini dogrular -> guvenlik
+         etkisi YOK. Yalnizca gereksiz ekstra I/O.
+Etki   : Yok.
+Durum  : FIXLENDI (V5.3) - hcli.py:299 bolgesine bilincli tasarim notu
+         eklendi (cift-acma yalnizca UYARI karari icindir; yetkili
+         dogrulama decrypt_file icinde yeniden yapilir; arada dosya
+         degisse TOCTOU zararsiz - uyari metnini etkiler, sifreleme
+         dogrulugunu etkilemez). Davranis DEGISMEDI.
+
+--------------------------------------------------------------------------------
+BULGU 8 [BILGI]  cmd_generate_passphrase feedback yazdirir
+Konum : hcli.py:429 (check_passphrase_strength feedback print)
+Detay : zxcvbn feedback'i passphrase'in parcalarini YANKILAMAZ; dictionary
+        eslesmesinde kelimenin kendisi gizlenir (hyper_cipher.py:1924-1927,
+        DENETIM 5 [13] korumasi) - yalnizca "sozluk kelimesi iceriyor" gibi
+        desen bilgisi doner. Uretilen Diceware perdesi zaten rastgeledir.
+Etki   : Yok.
+Durum  : DEĞERLENDIRILDI (V5.3) - degisiklik GEREKMEDI. Feedback perde
+         parcalarini YANKILAMIYOR (dictionary kelimesi gizlenir); sifirlama
+         yalnizca tty'de. Log sizintisi yok.
+
+--------------------------------------------------------------------------------
+BULGU 9 [BILGI]  --passphrase-file + --allow-weak bilincli risk kabulu
+Konum : hcli.py:215-221
+Detay : Script'ler zayif perdeyle sifrelemek icin --allow-weak kullanabilir.
+        v5 tasariminin belgelenmis acik risk kabulu (encrypt reddeder,
+        decrypt sadece uyarir, keyfile varsa uyari bile yok - cunku asil
+        koruma ikinci faktordur). Kutuphane API'si zorlamaz (eski kod
+        kirilmasin). --allow-weak verilmeden zxcvbn'siz ortamda sifreleme
+        HER ZAMAN reddedilir (fail-closed, hyper_cipher.py:1958-1965).
+Etki   : Yok (tasarim karari).
+Durum  : DEĞERLENDIRILDI (V5.3) - degisiklik GEREKMEDI. Belirlenmis acik risk
+         kabulu; --allow-weak yoksa zxcvbn'siz sifreleme HER ZAMAN reddedilir
+         (fail-closed). Keyfile varliginda uyari atlanmasi dogru (asil koruma
+         ikinci faktor).
+
+--------------------------------------------------------------------------------
+BULGU 10 [BILGI] Donanim degisirse veri kilitlenir (availability)
+Konum : hyper_cipher.py:205-254 (fp -> master turetimine girer)
+Detay : MachineGuid/MAC/volume serial/proc/node degistiginde (yeni disk,
+        sanal makine gecisi, donanim degisimi) donanima-bagli paketler
+        acilamaz. Bu bir GUVENLIK ozelligidir (makine-atfetme) - bilincli
+        tasarim; portable mod (--portable) tasima icindir.
+Etki   : Yok (kullanici beklenen davranis).
+Durum  : DEĞERLENDIRILDI (V5.3) - degisiklik GEREKMEDI. Makine-atfetme
+         bilincli guvenlik ozelligidir; portable mod (--portable) tasima
+         yoludur. Kaldirmak guvenligi azaltirdi.
+
+--------------------------------------------------------------------------------
+TARAMA KAPSAYICILIGI (ne tarandi, nerede temiz cikti)
+--------------------------------------------------------------------------------
+1) Dinamik kod / enjeksiyon: eval, exec, compile, pickle, marshal,
+   subprocess, os.system, shell=True -> HICBIR dosyada YOK. subprocess
+   yalnizca test_hcli.py (CLI entegrasyon testleri, sys.executable ile
+   gercek CLI) ve test_professional.py:499 (icacls ACL dogrulama testi).
+2) Hardcoded sizlar: ornekler/*.py, demo.py, _demo_weak_pw.py -> perde/key/
+   token sabiti YOK (demo rastgele token_urlsafe; _demo_weak_pw yalnizca
+   "ankara1234" kurban demosu).
+3) Kripto cercevesi:
+   - nonce/salt: her cagri icin os.urandom (24/32 byte) - API sabit nonce
+     kabul etmez. Nonce-reuse imkansiz (encrypt yolu).
+   - keystream: cift aile (keyed BLAKE2b-512 XOR HMAC-SHA512) - bir aile
+     zayif kalirsa digeri korur.
+   - subkey zinciri: HKDF(master, nonce, info=index+prev_sub) - geri sarmak
+     imkansiz, her rotasyon tum oncekilere bagli.
+   - block_idx: uint64, struct.pack tasarsa OverflowError (fail-loud, sessiz
+     tekrar YOK).
+   - KDF: Argon2id(t=3, p=1, mem=kdf_n KiB); parse_header KDF ONCESI kdf_n
+     dogrular (saldirgan 256 MiB amplifikasyon yapamaz); env yalnizca
+     daraltabilir (DENETIM 5 [9]).
+   - MAC: Encrypt-then-MAC, HMAC-SHA512, auth key HKDF ile ayri turetilir;
+     karsilastirma her yerde hmac.compare_digest.
+   - Padding: ISO 7816-4, her zaman >=1 byte; unpad YALNIZCA HMAC
+     dogrulandiktan SONRA (padding-oracle yok); bozuk padding fail-closed.
+4) Dosya I/O:
+   - Gecici dosyalar: O_EXCL + random isim + 0600; Windows CreateFileW +
+     protected DACL (SDDL D:P(A;;FA;;;user_sid)) + dwShareMode=0 +
+     CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT (symlink/junction karsi).
+   - TOCTOU: boyut acilmis fd uzerinden fstat; Windows ACL/sahip kontrolu
+     acilmis handle uzerinden GetSecurityInfo; POSIX O_NOFOLLOW.
+   - ATOMIC commit: fsync + os.replace; hata durumunda tmp silinir.
+   - IKI GECISLI verify-then-decrypt: PASS1 HMAC akisi (hicbir dosya
+     acilmaz), PASS2 seek+decrypt; PASS2'de HMAC YENIDEN hesaplanir
+     (PASS1-PASS2 arasi dosya degisimi TOCTOU'su kapali).
+   - Keyfile: O_EXCL, olusturma-ve-ACL atomik; entropi sanity (<8 distinct
+     bayt VEYA Shannon <3.0 -> red); boyut [32..1MiB] cap; okuma acilan fd
+     uzerinden dogrulanir.
+   - Self-overwrite (out==in): input handle kapanmadan replace YAPILMAZ.
+5) CLI: tty yoksa passphrase istemi REDDEDILIR (getpass fallback sizintisi
+   kapali); --passphrase-file 0600 + 1MiB cap + open-then-verify; girdi
+   dosyasi yoksa exit 2; tum hata siniflari temiz mesaj + exit 1/130;
+   UTF-8 reconfigure + backslashreplace (pipe'ta UnicodeEncodeError yok);
+   progress/boyut istatistikleri yalnizca tty (log sizintisi yok);
+   hedef var kontrolu + .hyp-*.tmp kalinti taramasi.
+6) Test altyapisi: 177 passed / 2 skipped; testlerde sert kripto deseni
+   disinda hicbir tehlikeli desen yok; TDD RED->GREEN gecmisi mevcut.
+
+--------------------------------------------------------------------------------
+GUVCLENDIRME ENVANTERI (onaylanan katmanlar - V4 ve onceki turlardan)
+--------------------------------------------------------------------------------
+- Anti-oracle: hata mesajlari tek tip ("dogrulama basarisiz - yanlis
+  passphrase, farkli makine veya kurcalanmis veri"); fp erken kontrol
+  edilmez; keyfile-gerekli hata ipucu oracle degil (flag plaintext header).
+- Header: MAGIC YOK (paket rastgele veri gorunur); tanimsiz flag bitleri
+  reddedilir; rotation 64 kati + [64..65535]; legacy rotation=0 varsayilana
+  cevrilir; VERSION cakisma kabulu yok.
+- Passphrase: NFC normalizasyon (SP 800-63B); bos/whitespace reddi; zxcvbn
+  yoksa assert_strong FAIL-CLOSED (hicbir perde kabul edilmez); dictionary/
+  yil/desen cezalari fail-conservative; Diceware EFF 7776 zorunlu (zayif
+  yedek liste kaldirildi), secrets.choice ile 6 kelime ~=77.5 bit.
+- RAM: tum mutable materyal wipe edilir; keyfile branch'inde pw_bytes ayri
+  wipe edilir (DENETIM 5 [10]).
+- Env girdisi: HYPERCIPHER_MAX_KDF_N yalnizca daraltabilir + 2'nin kuvveti
+  zorunlu (fail-closed).
+
+--------------------------------------------------------------------------------
+KARAR
+--------------------------------------------------------------------------------
+Bu tarama, onceki 4 denetim turu + V4 (7/7) fixlerinin uzerine yapildi.
+ISTISMAR EDILEBILIR GUVENLIK ACIĞI BULUNAMADI. Bulunan 10 gozlemden 9'u
+BILGI seviyesi (bilinen/kabul edilmis sinirlar veya kod kalitesi notlari),
+1'i DUSUK (deterministik test API'sinin yanlis kullanim senaryosu - zaten
+docstring ile isaretli). Fix uygulanmasi GEREKMIYOR; BULGU 1 icin README
+uyarisi istege bagli ek tedbirdir.
+
+-------------------------------------------------------------------------------
+V5.3 FIX TURU (2026-08-13) - TUM GÖZLEMLER KAPANDI
+-------------------------------------------------------------------------------
+Kullanici talebi: "Tamamen hepsini fixle. 5 kez research ardindan
+kriptografideki en guclu fix problemi icin."
+
+RESEARCH (5 tur, websearch - libsodium/Tink/age/PEP 842/NIST SP 800-108r1):
+  1. libsodium nonce-misuse-resistance (cift gecisli semalar) -> tasarim
+     degisikligi gerektirir, uyumlulugu kirardi - secilmedi.
+  2. Tink felsefesi: nonce-misuse'a duyarsiz modu kullaniciya ACIK birakma
+     -> en guclu fix = deterministic API'yi FAIL-CLOSED yap.
+  3. age STREAM nonce yapisi (11 byte sayac + 1 byte last-flag) -> key
+     tek-kullanimlidir; bizim model nonce'i paket basina random uretir.
+  4. PEP 842 Module Exports -> alt cizgi / opt-in gelenegi.
+  5. NIST SP 800-108r1 context encoding (uzunluk-on-ekli alanlar) -> ayrac
+     tekliligi ilkesi (BULGU 2 fixi).
+
+UYGULANAN FIXLER (7 kod + 3 durum notu):
+  [1] DUSUK  FIXLENDI: _DETERMINISTIC_MODE=False fail-closed guard.
+              _encrypt_core/_encrypt_file_core ic core'lari cikarildi
+              (public encrypt()/encrypt_file() CSPRNG ile bunlari cagirir).
+              conftest.py + test dosya baslari opt-in. TestV5Guards.
+  [2] BILGI  FIXLENDI: _derive_master fp_blob NUL byte -> ValueError
+              (ayrac tekliligi; KDF girdisi DEGISMEDI, eski paketler acilir).
+  [3] BILGI  FIXLENDI: GetVolumeInformationW tam argtypes/restype (WinDLL).
+  [4] BILGI  FIXLENDI: docstring - env yeniden okuma bilincli tasarim.
+  [5] BILGI  FIXLENDI: docstring - wipe() immutable siniri aciklamasi.
+  [6] BILGI  DEĞERLENDIRILDI: degisiklik gerekmedi (age/sympa deseni dogru).
+  [7] BILGI  FIXLENDI: hcli.py docstring - cift-acma bilincli, TOCTOU zararsiz.
+  [8] BILGI  DEĞERLENDIRILDI: feedback perdeyi yankilamiyor (zaten guvenli).
+  [9] BILGI  DEĞERLENDIRILDI: --allow-weak bilincli tasarim (fail-closed durur).
+  [10] BILGI DEĞERLENDIRILDI: donanim kilitlenmesi ozellik (--portable var).
+
+KANIT (tumu gecti):
+  - python -m pytest -q --no-header      -> 180 passed, 2 skipped (80.1s)
+  - python -m unittest test_hcli test_hyper_cipher test_professional
+                                       -> 182 OK, 2 skipped (44.6s)
+  - python -m pyright (6 dosya)          -> 0 errors, 0 warnings
+  - python hcli.py selftest              -> [OK] SELF-TEST GECTI
+  - python demo.py                       -> [OK] DEMO TAMAM
+  - Guard dogrulamasi: uretim ortaminda hc._DETERMINISTIC_MODE=False iken
+    _encrypt_deterministic -> RuntimeError (beklenen, dogrulandi).
+
+SONUC: 10/10 gozlem kapandi. Uretim kodu degismedi (yalnizca guard + core
+ayristirma + imza + yorumlar). Public API, paket formati, KDF girdisi ve
+geriye uyumluluk BIREBIR KORUNDU (VERSION 4, golden vektorler yesil).
+
+--------------------------------------------------------------------------------
+V5.4 SOLO DENETIM TURU (2026-08-13) - TAM KAYNAK OKUMASI
+--------------------------------------------------------------------------------
+Kullanici talebi: "2 agent codebaseyi tamamen tarasin - kod yanlislari/
+genel vuln'leri DEGIL, SADECE HyperCipher'in güvenlik aciklarini bulsun."
+Agent denemeleri basarisiz oldu (model kotasi yok + opencode kapandi),
+kullanici onayi ile denetim TEK BASINA (agentsiz) tamamlandi.
+
+YONTEM: hyper_cipher.py (2151 satir) + hcli.py (562 satir) SATIR SATIR
+okundu (parcali grep degil - tam okuma). demo.py, calibrate.py,
+_demo_weak_pw.py, test dosyalari ve ststests.py tehlikeli desen taramasindan
+gecti (eval/exec/pickle/os.system/shell=True/subprocess: yalnizca test
+dosyalarinda subprocess.run([sys.executable, ...]) - zararsiz).
+Kripto, header, I/O, ACL, CLI, DoS cap, padding, TOCTOU yeniden dogrulandi.
+
+SONUC: ISTISMAR EDILEBILIR GUVENLIK ACIĞI BULUNAMADI (0 adet).
+       5 yeni gozlem kaydedildi (1 DUSUK, 4 BILGI). Hicbiri saldirgan
+       tarafindan istismar edilebilir degildir; 1'i (BULGU 11) istege
+       bagli guclendirme olarak onerilir.
+
+--------------------------------------------------------------------------------
+BULGU 11 [DUSUK]  _check_private_file_windows ACL taramasi EKSIK
+Konum : hyper_cipher.py:1647 (READ_BITS), 1733-1762 (WORLD_SIDS + ACE dongusu)
+Detay : Windows keyfile/passphrase-dosyasi guvenlik kontrolu yalnizca 3
+        toplu SID'i reddediyor: Everyone (S-1-1-0), Authenticated Users
+        (S-1-5-11), BUILTIN\Users (S-1-5-32-545). Iki kapsam boslugu:
+        (a) SPESIFIK baska bir kullaniciya READ veren ACE (S-1-5-21-...-kullanici)
+        yakalanmaz - dosya sahibi sizsiniz ama baska bir hesaba acik olabilir
+        ve kontrol GECER. (b) READ_BITS yalnizca okuma/execute/AllAccess
+        maskelerini tarar; WRITE-ONLY ACE (FILE_WRITE_DATA 0x2) veren world
+        SID kontrolu gecer -> keyfile disaridan DEGISTIRILEBILIR (tampering).
+Etki   : (a) hedef makinede ikinci bir kullanici hesabi varsa + keyfile'a
+         acikca READ ACE'i verilmisse gizlilik kaybi mumkun (perdeyle birlikte
+         ele gecirilirse acilir). (b) keyfile bozulmasi = DoS (perde tek
+         basina yetmez, yeni keyfile eski paketleri acmaz).
+Durum  : DEĞERLENDIRILDI - istismar icin olagandisi ACL yapilandirmasi gerekir
+         (varsayilan generate-keyfile DACL'i D:P(A;;FA;;;kullanici) zaten
+         SADECE sahibe acik). Istege bagli guclendirme: allowed ACE'de
+         read-bit'i olan HER SID'i sahip kullanici haric reddet (SYSTEM/
+         Administrators tolere edilir, POSIX 0o600 root paraleli).
+         KOD DEGISIKLIGI ONAYSIZ YAPILMADI.
+
+--------------------------------------------------------------------------------
+BULGU 12 [BILGI]  Diceware wordlist: yalnizca SAYI kontrolu, benzersizlik yok
+Konum : hyper_cipher.py:2127-2131 (_load_diceware_words)
+Detay : len(words) < 7776 ise ValueError (fail-closed). Ancak 7776 SATIR
+        iceren ama TEKRARLAYAN kelimeler barindiran bir liste (orn. 100
+        benzersiz kelime x 78 kopya) sayi kontrolunden GECER - gercek
+        entropi log2(100)~=6.64 bit/kelimeye duser, kullanici hala ~77.5 bit
+        zanneder. Paketle gelen dosya guvenilir kabul edilir ama dogrulama
+        benzersizlik icermez.
+Etki   : Wordlist dosyasi degistirilirse (paket bozulmasi, kotu niyetli
+         yukleme) sessiz entropi dususu. Konfigurasyon/kurulum suistimali
+         gerektirir; uzaktan istismar edilemez.
+Durum  : DEĞERLENDIRILDI - BILGI. Oneri: len(words) != len(set(words))
+         kontrolu eklemek ucuz ve deterministik.
+
+--------------------------------------------------------------------------------
+BULGU 13 [BILGI]  generate_keyfile: ebeveyn dizin varsayilan modla olusur
+Konum : hyper_cipher.py:1586-1587 (os.makedirs(directory, exist_ok=True))
+Detay : Hedef dizin yoksa os.makedirs POSIX'te 0o777 & umask (genelde 0755)
+        ile olusturur. Keyfile dosyasinin kendisi 0600/O_EXCL (Windows'ta
+        protected DACL) ile korunur, AMA ebeveyn dizin dunya-yazilabilir
+        degilse bile dizin-okunur olabilir: dosya adi/varligi metadata
+        olarak sizar. Dunya-YAZILABILIR bir dizinde ise baska kullanici
+        keyfile'i UNLINK edebilir (dizin yazma hakki dosya modunu asar) -> DoS.
+Etki   : Metadata sizintisi + (dunya-yazilabilir dizinde) keyfile silme = DoS.
+         Icindeki 0600 dosyayi okuma imkani YOKTUR.
+Durum  : DEĞERLENDIRILDI - BILGI. Oneri: makedirs(mode=0o700) parametresi.
+
+--------------------------------------------------------------------------------
+BULGU 14 [BILGI]  .hyp-*.tmp kalinti taramasi DoS vektoru
+Konum : hcli.py:96-103 (_guard_output)
+Detay : Cikti dizininde HERHANGI bir .hyp-*.tmp varsa encrypt/decrypt
+        "kalan gecici dosya(lar)" ile REDDEDILIR. Saldirgan hedef dizine
+        yazabiliyorsa (ortak/tmp dizin) bos bir .hyp-x.tmp olusturarak
+        o dizine yapilacak islemleri KALICI engelleyebilir. Ayrica iki
+        paralel encrypt ayni dizinde calisirsa biri digerinin canli tmp'ini
+        "kalinti" sanabilir (yanlis pozitif).
+Etki   : Yerel DoS (availability). Dizine yazabilen saldirgan zaten dosya
+         silebilir/doldurabilir - onem sinirlidir. Content hirsizligi yok.
+Durum  : DEĞERLENDIRILDI - BILGI. Tasarim bilincli (yarim kalmis plaintext
+         kalisini yakalamak); alternatif: tmp yasi siniri (st_mtime > N dk)
+         ile gercek kalintilari canli tmp'lerden ayirmak.
+
+--------------------------------------------------------------------------------
+BULGU 15 [BILGI]  _open_private_file_read: FIFO/device dosyasi acilabilir
+Konum : hyper_cipher.py:1782-1793 (POSIX kolu)
+Detay : O_NOFOLLOW symlink'i engeller ama FIFO veya device dosyayi ENGELLE-
+         MEZ. Path'te bir FIFO varsa os.open(O_RDONLY) writer gelene kadar
+         BLOKLAR (hang). Path kullanici tarafindan verildigi ve keyfile/
+         passphrase dosyasi genelde kullanicinin kendi dizininde oldugu icin
+         saldirgan path'i kontrol edemez; Windows'ta os.open FIFO acmaz.
+Etki   : Teorik DoS/hang; pratikte saldirganin path uzerinde kontrolu
+         gerektirir. Gizlilik etkisi YOK.
+Durum  : DEĞERLENDIRILDI - BILGI. Oneri (POSIX): acilista O_NONBLOCK ve
+         acilis sonrasi S_ISREG(fstat) dogrulamasi eklemek.
+
+--------------------------------------------------------------------------------
+YENIDEN DOGRULANAN (bu turda tekrar okunup saglam bulunan):
+- Kripto: Argon2id KDF, dual-PRF keystream (keyed BLAKE2b-512 XOR HMAC-SHA512),
+  HKDF subkey zinciri (rewind imkansiz), auth-key domain ayrimi, Encrypt-then-
+  MAC + compare_digest, nonce 24-byte CSPRNG (public API'de sabit nonce YOK),
+  _DETERMINISTIC_MODE=False guard (V5.3), block_idx/rotation_idx uint64.
+- I/O: PASS1/PASS2 verify-then-decrypt + PASS2 re-HMAC (TOCTOU kapali), tmp
+  yalnizca dogrulama sonrasi, fsync + os.replace atomik, Windows protected
+  DACL + dwShareMode=0 + CREATE_NEW, POSIX mkstemp 0600 O_EXCL, O_NOFOLLOW,
+  open-sonrasi-fstat, done != data_len kontrolu, S_ISREG girdi kontrolu.
+- Header: magic YOK, flag/rotation/kdf_n fail-closed, KDF DoS cap KDF'den
+  ONCE, uzunluk kontrolu KDF'den once.
+- CLI: tty zorunlu (getpass), --passphrase-file 0600/ACL + boyut cap, zayif
+  perde uyarisi (decrypt) / red (encrypt, --allow-weak disinda), progress
+  yalnizca tty, UTF-8 reconfigure, temiz exit kodlari (0/1/2/130).
+
+KANIT: Bu tur KOD DEGISIKLIGI ICERMEZ (saf denetim) -> mevcut test sonuclari
+gecerliligini korur (pytest 180 passed/2 skipped; unittest 182 OK; pyright 0).
+
+-- tarama sonu --
+
+================================================================================
+V5.5 FIX TURU (2026-08-13) - BULGU 11-15 KAPANDI (5/5)
+================================================================================
+
+Oncesi: V5.4 solo denetim 0 exploitable vuln; 5 gozlem (BULGU 11-15) raporlandi.
+Bu tur: 5x websearch research (OpenSSH check_acl, EFF diceware, bpo-19930,
+QLockFile mtime esigi, SEI CERT FIO32-C) + en guclu desenlerle hedefli fix.
+
+------------------------------------------------------------------------
+BULGU 11 (DUSUK) - Windows DACL: blacklist -> ALLOWLIST ................. KAPANDI
+------------------------------------------------------------------------
+SORUN: Eski WORLD_SIDS blacklist (Everyone/Authenticated Users/Users)
+yalnizca 3 toplu SID'i reddediyordu. (a) SPESIFIK baska bir kullaniciya
+READ veren ACE (S-1-5-21-...-kullanici) kontrolu GECIYORDU; (b) READ_BITS
+ismi yanilticiydi ve sira disi write-only ACE'ler belirsizlik birakiyordu.
+FIX (OpenSSH check_acl allowlist deseni, Win32-OpenSSH issue #2317):
+- READ_BITS -> ACCESS_BITS (0x80000000|0x00120089|0x10000000|0x001F01FF)
+  = dosyaya HERHANGI bir erisim; write-only ACE de yakalanir.
+- WORLD_SIDS blacklist -> ALLOWED_SIDS whitelist: {sahip, SYSTEM,
+  S-1-5-32-544 (Admins), S-1-3-4 (OWNER RIGHTS)}. Dosyaya erisim veren
+  her ALLOWED ACE, yalnizca bu SID'lere ait olabilir; baska her SID
+  fail-closed REDDEDILIR (specifik kullanici dahil).
+- INHERIT_ONLY_ACE (0x08) bayraklari atlanir (dosyada etkisiz, cocuklara
+  uygulanir).
+KANIT: test_windows_spesifik_kullanici_ace_reddedilir (Guests READ ->
+ValueError), test_windows_write_only_ace_reddedilir (Guests W -> ValueError).
+Smoke: generate_keyfile protected DACL gecti; Guests (S-1-5-32-546) READ
+eklenen dosya reddedildi.
+NOT: Bu makinede AppData\Local\Temp ACL'si 6 yabanci SID'e acik (inherited
+ACE'ler) - B11 bunlari DOGRU yakaliyor. Testler _mkdtemp_secure() ile
+icacls /inheritance:r + explicit grant (kullanici+SYSTEM+Admins) kullanir.
+
+------------------------------------------------------------------------
+BULGU 12 (BILGI) - Diceware benzersizlik ............................... KAPANDI
+------------------------------------------------------------------------
+SORUN: _load_diceware_words yalnizca SATIR SAYISINI (>=7776) kontrol
+ediyordu. 7776 satir iceren ama tekrarlayan kelimeler barindiran bir liste
+(100 benzersiz x 78 kopya) sayi kontrolunden gecerdi; gercek entropi
+log2(100)~=6.64 bit/kelimeye duserdi.
+FIX (Reinhold diceware.txt kurali: "there should be no duplicates"):
+len(words) != len(set(words)) -> ValueError (fail-closed). Zayif yedek
+liste KULLANILMAZ.
+KANIT: test_wordlist_tekrarlayan_kelime_reddedilir (mock: "ab\t00000"*7776
+-> ValueError), test_wordlist_benzersiz_gecer (7776 benzersiz -> yuklenir).
+
+------------------------------------------------------------------------
+BULGU 13 (DUSUK) - generate_keyfile ebeveyn dizin mode ................. KAPANDI
+------------------------------------------------------------------------
+SORUN: os.makedirs varsayilan 0o777 & ~umask (genelde 0o755) ile ebeveyn
+dizin olusturuyordu -> dizin-okunur (metadata sizintisi) ve dunya-yazilabilir
+dizinde keyfile UNLINK edilebilirdi (DoS).
+FIX (bpo-19930, Python 3.7+): mode yalnizca LEAF dizine uygulanir -
+buradaki directory = keyfile'in dogrudan ust dizini -> mode=0o700 tam
+dogru. Windows'ta mode yok sayilir; koruma protected DACL'dedir.
+KANIT: test_keyfile_ebeveyn_dizin_0700 (POSIX-only: yeni_alt dizin 0o700).
+
+------------------------------------------------------------------------
+BULGU 14 (BILGI) - _guard_output taze/aktif tmp yanlis pozitif + DoS .... KAPANDI
+------------------------------------------------------------------------
+SORUN: (a) iki PARALEL islem birbirinin CANLI tmp'ini "kalinti" sanip yanlis
+pozitif uretiyordu; (b) hedef dizine yazma hakki olan saldirgan bos bir
+.hyp-x.tmp olusturarak islemleri KALICI engelleyebiliyordu (DoS).
+FIX (QLockFile/proper-lockfile mtime esigi deseni):
+- Yalnizca 3600s'den ESKI (st_mtime) tmp dosyalari kalinti sayilir; taze
+  dosya = suryen/paralel islem -> gecirilir.
+- POSIX'te ek guvenlik: baska kullaniciya ait (st_uid != geteuid) dosyalar
+  yok sayilir (saldirgan kendi uid'iyle olusturdugu dosyayi "kalinti"
+  gibi gosteremez). Windows'ta st_uid her zaman 0 -> yas esigi yeterli
+  (canli tmp dwShareMode=0 ile kilitli).
+KANIT: test_kalan_tmp_reddedilir (mtime -2s -> red), test_taze_tmp_gecer
+(yeni olusturulan -> gecirilir), test_baska_kullanici_tmp_yok_sayilir
+(POSIX-only, chown farkli uid -> gecirilir).
+
+------------------------------------------------------------------------
+BULGU 15 (BILGI) - _open_private_file_read FIFO hang ................... KAPANDI
+------------------------------------------------------------------------
+SORUN: POSIX'te FIFO path'i os.open(O_RDONLY) ile BLOCK'lanirdi (writer
+gelene kadar hang); fstat/S_ISREG kontrolune asla ulasilamazdi.
+FIX (SEI CERT FIO32-C + now-playing _io_safe.py deseni):
+- flags'e O_NONBLOCK eklenir -> open aninda doner.
+- S_ISREG kontrolu MODE'DAN ONCE gelir (FIFO/device/dizin/soket 0600 gibi
+  gorunse bile reddedilir).
+- Regular dosya dogrulandiktan sonra fcntl(F_SETFL) ile O_NONBLOCK dusurulur
+  (read() davranisi belirsiz olmasin diye - FIO32-C).
+KANIT: test_fifo_reddedilir_hang_yok (POSIX-only: mkfifo 0600 -> ValueError
+<2s, hang yok).
+
+========================================================================
+OZET: 5/5 BULGU KAPANDI. Testler (eksiksiz kapsam, test_professional.py
+dahil): pytest 185 passed/5 skipped; unittest 190 OK/5 skipped; pyright
+0/0. Demo OK; uretim guard RuntimeError OK.
+-- V5.5 fix turu sonu --
+
+========================================================================
+PROBLEM FIX TURU (2026-08-13) - guvenlik DISI kod problemleri 6/6
+========================================================================
+KAPSAM: Guvenlik taramasi bittikten sonra kodun PROBLEMLER/ERRORLER'i
+icin tam codebase turu: 14 .py dosyasinin tamami okundu + compileall +
+pyright + pyflakes + tam pytest + demo + hcli selftest canli calistirildi.
+
+BULGU P1 (TEMIZLIK) - olumlu sabitler ............................ KAPANDI
+SORUN: _create_private_file_windows icinde TOKEN_QUERY / TokenUser
+tanimli ama HICBIR YERDE kullanilmiyordu (token islemleri
+_current_user_sid_string'de ayri sabitlerle yapiliyor).
+FIX: iki olumlu satir silindi.
+KANIT: pyflakes "assigned to but never used" uyarilari 0'a indi.
+
+BULGU P2 (BAKIM) - generate_keyfile'da hardcoded 32 .............. KAPANDI
+SORUN: KEYFILE_MIN_BYTES = 32 sabiti vardi ama generate_keyfile
+sinir kontrolunde ve hata mesajinda literal "32" kullaniliyordu;
+sabit degisirse kod suruklenirdi.
+FIX: KEYFILE_MIN_BYTES <= length <= KEYFILE_MAX_BYTES ve hata
+mesajinda [{KEYFILE_MIN_BYTES}..{KEYFILE_MAX_BYTES}].
+KANIT: davranis birebir ayni (32 == KEYFILE_MIN_BYTES); mevcut
+keyfile sinir testleri gecti.
+
+BULGU P3 (KOD KOKUSU) - placeholdersiz f-string ................. KAPANDI
+SORUN: hcli.py generate-passphrase "Passphrase (asagidaki perdeyi
+girin):" satirinda f"" on eki gereksizdi (icinde {} yok).
+FIX: f on eki kaldirildi (duz string).
+KANIT: python hcli.py generate-passphrase --words 6 canli OK.
+
+BULGU P4 (TEMIZLIK) - kullanilmayan import ...................... KAPANDI
+SORUN: test_hyper_cipher.py "import sys" ve test_professional.py
+"import hashlib" hic kullanilmiyordu.
+FIX: iki import satiri silindi.
+KANIT: pyflakes EXIT 0.
+
+BULGU P5 (TEMIZLIK) - olumlu atama ............................. KAPANDI
+SORUN: test_hyper_cipher.py test_pw_bytes_bytearray_ve_wipe icinde
+"master = hc._derive_master(...)" sonucu kullanilmiyordu (testin amaci
+cagrinin hata vermemesiydi) ve anahtar materyali referans tutuluyordu.
+FIX: atama kaldirildi -> cagri bare (amaca sadik + wipe hijyeni).
+KANIT: test hala geciyor.
+
+KANIT (tum tur): pyflakes 14 dosya EXIT 0; pyright 0/0;
+pytest 185 passed/5 skipped (regresyon YOK, baz 185/5 ile ayni);
+demo OK; hcli selftest OK; generate-passphrase canli OK.
+-- Problem fix turu sonu --
+
+================================================================================
+BULGU 16-21 (onceki oturumda KODDA fixlenmis, rapora islenmemisti)
+================================================================================
+NOT: Asagidaki 5 bulgu bu rapordan onceki bir oturumda kod icinde fixlenmisti
+(research destekli yorumlarla) ancak rapor dosyasina yazilmamisti. Bu tur once
+ampirik olarak dogrulandi, sonra rapora isleniyor.
+
+BULGU 16 [DUSUK] _current_user_sid_string ConvertSidToStringSidW LocalFree
+  eksigi (bellegi sizdirir) ................. KAPANDI (kod:1367-1455)
+  FIX: LocalFree prototipi + donen string her zaman LocalFree ile iade.
+  KANIT (bu tur): 30000 cagrida PrivateBytes delta 0KB -> sizinti yok.
+
+BULGU 17 [DUSUK] _encrypt_file_core master derive/tmp siralamasi wipe gap
+  ............................................ KAPANDI (kod:991-1002)
+  FIX: "create secrets late, destroy early" - once tmp tahsis edilir, master
+  try ICINDE turetilir; tum hata yollari finally/wipe kapsamina girer.
+
+BULGU 18 [DUSUK] production assert -O ile silinir .... KAPANDI (kod:1285)
+  FIX: OpenSSF pyscg-0037 + Bandit B101 + PyNaCl ensure() deseni; assert yerine
+  explicit fail-closed raise.
+
+BULGU 20 [DUSUK] GetAce basarisizsa ACE sessizce atlaniyordu (fail-open)
+  ............................................ KAPANDI (kod:1853-1858)
+  FIX: MSDN GetAce "fail securely"; AceCount icinde GetAce basarisizsa raise.
+
+BULGU 21 [DUSUK] ACE type coverage yalnizca ACCESS_ALLOWED_ACE_TYPE
+  ............................................ KAPANDI (kod:1844-1870)
+  FIX: MS-DTYP 2.4.4; object allow ACE kapsandi, callback allow ACE fail-closed.
+
+================================================================================
+V5.6 DENETIM + FIX TURU (2026-08-27) - Qwen 3.8 Max, agentsiz
+================================================================================
+Kullanici talebi: "güçlü modele geçtim Qwen 3.8 Max tamamen incele HyperCipher'i
+EN KÜÇÜK VULN BİLE İSTEMİYORUM" -> tam denetim; ardindan "Sadece YENİ
+BULGULARI duzelt, 5 research > kriptografinin en guclu fixi > uygula".
+
+AMPiRiK DOGRULAMA (bu tur, probe'larla):
+  - Timing oracle: yanlis 71.5ms vs dogru 76.1ms -> %6 fark, oracle YOK
+    (KDF her iki yolda da calisir).
+  - Deterministic guard fail-closed RuntimeError; pad_to 16/100/65536 roundtrip
+    OK, 0/15/65537/-1 red; byte-flip fuzz 184/184 red; kesik/ek byte red.
+  - Bellek sizintisi (30000 _current_user_sid_string): PrivateBytes delta 0KB
+    -> BULGU 16 fix'i calisiyor.
+  SONUC: ISTISMAR EDILEBILIR ACIK YOK; 4 yeni gozlem (1 DUSUK + 3 BILGI).
+
+--------------------------------------------------------------------------------
+BULGU A [DUSUK] _make_tmp_near_windows FILE_FLAG_OPEN_REPARSE_POINT eksik-KAPANDI
+--------------------------------------------------------------------------------
+SORUN: tmp dosya olusturan _make_tmp_near_windows CreateFileW cagrisinda
+FILE_FLAG_OPEN_REPARSE_POINT yoktu; oysa _create_private_file_windows ve rapor
+satir 201 bunu kullaniyor/iddia ediyordu. CreateFileW varsayilan olarak reparse
+point'leri (symlink/junction) TAKIP EDER -> tmp yolu reparse point icerirse
+plaintext baska konuma yazilabilir.
+RESEARCH (5 kaynak: MSDN CreateFileW/CreateFile3, OWASP Insecure Temporary File,
+IOActive File-Squatting, CERT POS01-C/FIO32-C, MS-SMB/NtCreateFile): flag
+0x00200000, CREATE_NEW ile gecerli (yalnizca CREATE_ALWAYS ile yasak); dosya
+reparse point degilse yok sayilir (normal davranis ayni); POSIX O_NOFOLLOW'in
+Windows karsiligidir.
+FIX: _make_tmp_near_windows icine FILE_FLAG_OPEN_REPARSE_POINT sabiti +
+CreateFileW flag'ine OR'landi. Windows/POSIX parity saglandi.
+KANIT: encrypt_file/decrypt_file roundtrip OK (4264B), kalinti tmp yok.
+
+--------------------------------------------------------------------------------
+BULGU B [BILGI] README env cap bayat ............................ KAPANDI
+--------------------------------------------------------------------------------
+SORUN: README:169-171 HYPERCIPHER_MAX_KDF_N araligini [2^14..2^19]/512MiB
+yaziyordu; kod (MAX_KDF_N=1<<18, env >MAX_KDF_N reddi) ve README'nin geri
+kalani [2^14..2^18]/256MiB. Kod 256MiB uyguluyor.
+FIX: README:169-171 [2^14..2^18]/256MiB olarak duzeltildi.
+
+--------------------------------------------------------------------------------
+BULGU C [BILGI] README test sayisi bayat ........................ KAPANDI
+--------------------------------------------------------------------------------
+SORUN: README:296-297 "164 test" yaziyordu; gercek pytest 185 passed/5 skipped,
+unittest 190 test/5 skipped.
+FIX: README test sayilari guncellendi (unittest 190; pytest 190: 185 gecer +
+5 POSIX Windows'ta skip).
+
+--------------------------------------------------------------------------------
+BULGU D [BILGI/kasitli] Bandit B110 x3 fingerprint toplama ...... KAPANDI
+--------------------------------------------------------------------------------
+SORUN: hyper_cipher.py:245/252/284 fingerprint (MachineGuid/MAC/volume serial)
+try/except/pass -> bandit B110. Kasitli graceful degradation (bir kaynak
+okunamazsa digerleriyle devam; BULGU 10 bolgesi).
+FIX: uc except satirina "# nosec B110" + pass satirina kasit aciklamasi; bandit
+temizlendi (0 issue). Davranis DEGISMEDI.
+
+--------------------------------------------------------------------------------
+EK [BILGI] BULGU 20/21 bolgesinde 3 oneden var olan pyright tip hatasi-KAPANDI
+--------------------------------------------------------------------------------
+SORUN: ACE loop'unda p_ace.value (Optional[int]) uzerinde "+ N" aritmetigi ->
+pyright reportOptionalOperand x3. Yeni bulgu DEGIL; BULGU 20/21 fix'inden kalan
+tip hatasi (bu tur dogrulama sirasinda yakalandi).
+FIX: GetAce basarisi sonrasi ace_addr = p_ace.value yerel degiskeni + None ise
+fail-closed raise; aritmetik ace_addr uzerinden. Guvenlik mantigi birebir ayni.
+KANIT: pyright 0/0; Windows ACL testleri dahil pytest 185/5 (regresyon yok).
+
+================================================================================
+OZET (V5.6): 4 yeni bulgu (1 DUSUK + 3 BILGI) + 1 oneden tip hatasi kapandi;
+BULGU 16-21 rapora islendi. ISTISMAR EDILEBILIR ACIK YOK.
+KANIT: pytest 185 passed/5 skipped; bandit 0 issue (EXIT 0); pyright 0/0;
+pyflakes EXIT 0.
+-- V5.6 fix turu sonu --
+
+================================================================================
+V5.7 FIX TURU (2026-09-01) — 5x RE-SEARCH EDİLDİ, EN GÜÇLÜ DESENLERLE FIX
+================================================================================
+Prensip: her BULGU için 5 kez ReSearch (kaynak + dok + rakip kod) → en güçlü
+kriptografik/operasyonel fix → edit → pyright/pytest/probe ile kontrol →
+sonraki BULGU. Araştırma EDİLMEDEN fix YOK.
+
+--------------------------------------------------------------------------------
+BULGU-1 [ORTA] zxcvbn >72 ValueError — CLI/library inconsistency → KAPANDI
+--------------------------------------------------------------------------------
+SORUN: zxcvbn-python __init__.py:10 `len(password) > 72 → ValueError`. hcli.py:
+338 `check_passphrase_strength()` koruması yok; 80-char güvenli perde roundtrip
+OK ama CLI reddediyor — tutarsızlık + kütüphane çağırana DoS yüzeyi.
+Kök: dwolfhub/zxcvbn-python f54add5 `max_length=72`, README "strongly advise
+against setting max_length greater than 72" (DoS).
+
+5x RE-SEARCH:
+  1) dwolfhub/zxcvbn-python kaynak: __init__.py:10 max_length 72, test parametreli
+     max_length varyantı (asimptotik maliyet kanıtı)
+  2) dropbox/zxcvbn#194 (resmi): "truncate user input before passing to zxcvbn()"
+  3) NIST SP 800-63B 5.1.1.2: "SHOULD permit at least 64 characters" + "Truncation
+     of the secret SHALL NOT be performed" — KDF girdisi kesilmez, değerlendirme
+     penceresi kesilir
+  4) zulip/zulip#34146 (üretim vakası): zxcvbn 72 hatasının gerçek dünya çarpması
+  5) kütüphane çağrısı testi: 80-char perde encrypt/decrypt OK → CLI guard eksik
+
+EN GÜÇLÜ FIX (araştırma sentezi): NIST ikiliği — gizli anahtar TÜM uzunluk
+(Argon2id), değerlendirme PENCERELİ (zxcvbn). Çift pencere (ilk 72 + son 72)
+→ dropbox truncate önerisi + DoS'u uzunluktan bağımsız kılar + suffix-güçlü
+saldırıya temkinli (min). KDF asla truncate etmez.
+
+FIX:
+  hyper_cipher.py: ZXCVBN_MAX_INPUT_CHARS=72 + _zxcvbn_windows() (ilk 72 + son
+    72 min, fail-conservative) + _zxcvbn_feedback() + mesajdan "<=72" kaldırıldı
+    + RuntimeError guard tek kaynağa indirildi.
+  hcli.py:332-343 try/except ValueError → "BILGI: passphrase gücü doğrulanamadı
+    (zxcvbn bu girdide hata verdi — atlandı: {e})" (Productive Security: CLI
+    bloklamaz, kullanıcıyı bilgilendirir; KDF tam uzunluk).
+  test_hyper_cipher.py: TestV57Bulgu1 (4 test: 80/200-char + pencere mantığı).
+
+KANIT: probe_bulgu1.py + probe_bulgu1_cli.py E1/E2/E3 EXIT 0 (önce 1); pyright 0;
+pytest 189 passed/5 skipped (was 185, +4 yeni test).
+
+--------------------------------------------------------------------------------
+BULGU-2 [BILGI] Graph.py dokümantasyon senkron sapması — 7 mismatch → KAPANDI
+--------------------------------------------------------------------------------
+SORUN: Graph.py (graphviz + matplotlib neon) etiketleri kod sabitleriyle
+uyuşmuyordu (kaynak→doküman drift, archdrift/Staleguard literatürü):
+  1) kf 32..4096 B → KEYFILE_MAX_BYTES 1 MiB (1<<20) değil
+  2) salt 16 B → SALT_BYTES 32 değil (iki yerde: graphviz + matplot)
+  3) header = MAGIC(8)+VERSION(2)+kdf_n(2)+salt(16)+nonce(24)... → MAGIC yok,
+     gerçek: ver(1)+flags(1)+rot(2)+kdf_n(4)+salt(32)+nonce(24)+fp_hash(32)+
+     data_len(8)=104 B
+  4) _CipherState LRU 2 → kodda LRU yok (zincir: cur_sub+block_idx)
+  5) tag 32 B kesilmiş → TAG_BYTES 64 B (iki yerde)
+  6) chunk 64 KiB → CHUNK 1 MiB (1<<20) (iki yerde)
+  7) sec_labels "zxcvbn >72" → eşik ifadesi yanlış (>=10^14, 72-char pencere)
+
+5x RE-SEARCH:
+  1) archdrift (Bhatt et al.) + Staleguard: kod-doküman drift tipolojisi
+  2) DocOps/DocGuard/ETH anchored-spec: kaynak-tek-doğruluk, etiketlerin sabitlere
+     kenetlenmesi
+  3) diagram drift literatürü: etiketlerin header/CHUNK/TAG sabitlerinden türemesi
+  4) Doğrulama: hyper_cipher.py sabitlerinden tek tek karşılaştırma (7/7 eşleşsiz)
+  5) Matplotlib katman taraması: 6 katman × etiket → kod sabiti cross-check
+
+FIX: Graph.py 10 edit (graphviz 8 + matplot layers + sec_labels):
+  kf "32 B..1 MiB", HKDF info "HYPR/keyfile/v1", salt 32 B, header
+  "ver(1)+flags(1)+rot(2)+kdf_n(4)+salt(32)+nonce(24)+fp_hash(32)+data_len(8)
+   =104 B (MAGIC YOK)", _CipherState "zincir", tag 64 B, chunk 1 MiB,
+  header VIOLET katmanı tamamen düzeltildi, sec_labels "zxcvbn 72w >=1e14",
+  dice etiketi "zxcvbn 72-char pencere (>=10^14)".
+
+KANIT: payk × etiket == hyper_cipher.py sabiti (SALT=32 NONCE=24 TAG=64 CHUNK=1M
+HEADER=104 KEYFILE_MAX=1M MAGIC yok); Graph.py pyright 0; png üretimi OK.
+
+--------------------------------------------------------------------------------
+BULGU-3 [BILGI] Hijyen: ornekler *_cozuldu.py plaintext + __pycache__ → KAPANDI
+--------------------------------------------------------------------------------
+SORUN: ornekler/ornek_kod_cozuldu.py (ve v4) plaintext artefaktı + __pycache__
+/.pytest_cache kalıntısı repoda iz bırakıyor; diff temiz olsa da git hijyeni
+bozuk, .gitignore yok.
+
+5x RE-SEARCH:
+  1) Repo hijyen literatürü (gitignore best-practice: artefakt asla repoda durmaz)
+  2) Age/stream repo deseni: cozuldu/decrypted artefaktlar gitignore
+  3) Python hijyen: __pycache__/*.pyc/.pytest_cache repoya girmez
+  4) Doğrulama: fc /B ornek_kod.py vs ornek_kod_cozuldu.py → fark yok (roundtrip
+     doğru, ama artefakt yine de ignore)
+  5) .hyp-*.tmp kalıntı taraması (önceki raporda da)
+
+FIX: __pycache__ + .pytest_cache temizlendi (0 pyc); .gitignore eklendi:
+  __pycache__/, *.pyc/.pyo, .pytest_cache/, .hyp-*.tmp, ornekler/*_cozuldu.py,
+  *.key, HyperCipher_Graph artefaktları. fc diff: "no differences" (beklenen).
+
+KANIT: Get-ChildItem __pycache__ yok, pyc 0, fc "no differences", .gitignore var.
+
+================================================================================
+ÖZET (V5.7): 1 ORTA (BULGU-1) + 2 BILGI (BULGU-2/3) KAPANDI; İSTİSMAR EDİLEBİLİR
+AÇIK YOK (önceki turla aynı, V5.4 tam tarama korunuyor).
+KANIT: pyright 0/0; pytest 189 passed/5 skipped; Graph.py png OK; hijyen temiz.
+-- V5.7 fix turu sonu --

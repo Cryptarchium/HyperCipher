@@ -1,0 +1,292 @@
+﻿==============================================================================
+HYPERCIPHER v3 - ZAAFIYET RAPORU (NUMARALI) — DENETIM TURU 2
+Tarih: 2026-08-11
+Kaynak: 5 agent iptal edildi (model hatasi: free-tier limit / TPM rate limit /
+        kredi karti zorunlulugu). Denetim BIZZAT ana agent tarafindan yapildi:
+        satir-satir kaynak okuma + ampirik dogrulama (111/111 test, Windows
+        ACL testi, scrypt maliyet olcumu).
+Durum: Her bulgu kaynakta SATIR NUMARASI ile dogrulandi. Fix onerisi
+       uygulananlar ISARLENECEK. Kod degisikligi istenmedi - sadece rapor.
+       >>> DENETIM TURU 3 (2026-08-11): 7 bulgunun TAMAMI FIXLENDI. <<<
+       Kullanici talimati: "Research > en guclu kriptografi fixini bul > UYGULA"
+       (limitsiz arastirma). 3 librarian arastirmasi yapildi (Windows ACL,
+       verify-then-decrypt, scrypt parametre standartlari). Tum fixler kodda
+       uygulandi, 112/112 test + selftest GECTI, ACL ampirik dogrulandi (icacls).
+==============================================================================
+
+---------------------------------------------------------------------------
+KRITIK
+---------------------------------------------------------------------------
+
+(Kritik bulgu yok. Kripto cekirdegi saglam: encrypt-then-MAC, hmac.compare_digest
+timing-safe karsilastirma, salt/nonce ayrimi, zincirli subkey rotasyonu, master
+wipe, padding dogrulama-sonrasi kaldirma, fsync + os.replace atomic commit,
+64-byte tag. Onceki 36 maddenin tamami v3'te dogrulandi.)
+
+---------------------------------------------------------------------------
+YUKSEK
+---------------------------------------------------------------------------
+
+[1] YUKSEK - Windows'ta "0600 gecici dosya" iddiasi GECERSIZ: mkstemp ACL kalitimi
+    >>> FIX UYGULANDI (DENETIM TURU 3): _make_tmp_near_windows() eklendi - <<<
+    >>> ctypes CreateFileW + SECURITY_ATTRIBUTES + SDDL "D:P(A;;FA;;;{user_sid})" <<<
+    >>> (protected DACL: kalitim yok) + dwShareMode=0 (paylasim yok) + CREATE_NEW <<<
+    >>> (O_EXCL). POSIX'te mkstemp 0600 kalir. Ampirik kanit (icacls): ACL'de <<<
+    >>> YALNIZCA kullanici (F); SYSTEM/Admins/Authenticated Users YOK. <<<
+    >>> os.replace ACL'yi korur - hem .hyp hem cozulmus cikti kullaniciya ozel. <<<
+    >>> Kalici test: test_professional.py::TestAtomicity::test_windows_tmp_acl_... <<<
+    Yer: hyper_cipher.py _make_tmp_near() satir 790-804 (docstring satir 791-798:
+         "mkstemp + O_EXCL + 0600 ... baska kullanici okuyamaz")
+    Senaryo: _make_tmp_near docstring'i "0600 izinli (baska kullanici okuyamaz)"
+             diyor. Bu POSIX varsayimi. Windows'ta tempfile.mkstemp() mode
+             parametresi (0o600) YOK SAYILIR; dosya, icinde bulundugu dizinden
+             ACL KALITIR. Ampirik kanit (2026-08-11, gercek calistirma):
+               - stat mode: 0o666 (0600 degil!)
+               - icacls: SYSTEM:(I)(F), Administrators:(I)(F), kullanici:(I)(F),
+                 Authenticated Users:(I)(RX,W), sandbox SID'leri (I)(RX,W)
+             Sonuc: cozumlenen plaintext'i iceren .hyp-*.tmp dosyasi, ayni
+             makinedeki baska bir yerel kullanici/sandbox sureci tarafindan
+             OKUNABILIR. "0600" iddiasi Windows'ta guvenlik garantisi DEGIL.
+    Fix: (a) Windows'ta os.chmod ise yaramaz (ACL) -> acilis sonrasi
+             win32security/icacls ile ACL'yi yalnizca kullaniciya kistla, VEYA
+             (b) gecici dosyayi kullaniciya ozel guvenli dizinde olustur
+             (%TEMP% degil; ayni dizin gerektigi icin EXDEV sorunu var) -> en
+             pratik: os.fdopen sonrasi DOSYAYI ACIK TUTARAK yaz (fd'den gelen
+             handle kapanana kadar baska surec paylasim bayragi olmadan
+             acamaz; ama uzun islemde kilit riski) -> ONERILEN: CreateFileW ile
+             dwShareMode=0 + SECURITY_ATTRIBUTES ile yalniz kullaniciya ACL
+             (ctypes, ek bagimlilik yok), VEYA en azindan docstring'i
+             "Windows'ta dizinden ACL kalitir" diye GUNCELLE + riski belgele.
+    Not: Bu, onceki rapor [4]'un fix'ini Windows'ta GECERSIZ kiliyor. [4]
+         kapali sayilmaz - Windows tarafi acik.
+
+[2] YUKSEK - decrypt_file: plaintext HMAC dogrulamasindan ONCE diske yaziliyor
+    >>> FIX UYGULANDI (DENETIM TURU 3): decrypt_file IKI GECISLI oldu: <<<
+    >>> PASS 1 = tum ciphertext uzerinde HMAC-SHA512 akisi, HICBIR dosya <<<
+    >>> acilmaz, tek byte plaintext uretilmez. PASS 2 (tag OK ise) = <<<
+    >>> fin.seek(HEADER_BYTES) + decrypt + tmp'e yaz. Dogrulama basarisizsa <<<
+    >>> tmp_path None kalir (dosya HIC ACIKMAZ). Desen: libsodium <<<
+    >>> secretstream / age STREAM (verify-then-decrypt), GPG .part + MDC <<<
+    >>> hata sinifi tamamen kapandi. Test: truncation/kurcalama testleri <<<
+    >>> "tmp kalintisi yok" iddiasini gercek .hyp- deseniyle dogruluyor. <<<
+    Yer: hyper_cipher.py decrypt_file() satir 732-734:
+         "if pending: fout.write(pending)    # onceki chunk yaz (son degil)"
+         Dogrulama satir 740-742'de. Son chunk satir 755'te (dogrulama SONRASI).
+    Senaryo: Doku "HMAC dogrulandiktan sonra plaintext yazilir" izlenimi veriyor
+             (satir 745-747 yorumu "plaintext asla diske dusmez" diyor). Ancak
+             dongu ICINDE yalnizca SON chunk bekletiliyor; 1 chunk'tan buyuk
+             her dosyada onceki chunk'larin PLAINTEXT'I, HMAC dogrulamasi
+             GERCEKLESMEDEN tmp dosyaya yaziliyor. Dogrulama basarisiz olursa
+             tmp _safe_unlink ile silinir AMA: (a) process kill/power loss
+             aninda plaintext iceren .hyp-*.tmp kalintisi diskte kalir;
+             (b) [1]'deki Windows ACL sorunuyla birlestiginde bu kalinti
+             baska kullanicilarca okunabilir. Eski rapor [4]'te "plaintext
+             dogrulama oncesi diske yaziliyor" YUKSEK olarak isaretlenmisti;
+             fix KISMEN uygulanmis (yalniz son chunk bekletiliyor).
+    Fix: Tam fix -> butun plaintext'i ONCE bellekte buffer'la, dogrulama
+         GECTIKTEN SONRA tmp dosyaya yaz (bellek kullanimina karsi CHUNK
+         siniri = max 64 MiB dosya -> buffer; daha buyuk dosyalar icin
+         disk-backed staging veya kabul edilen riski belgele). Alternatif
+         (pratik): dogrulama-oncesi yazilan kismi dogrulama sonrasi SIFIRLA
+         (veri zaten diskte -> gizlilik acigi kalir) -> dogru cozum buffer.
+         Onerilen: CHUNK boyutuyla sinirli buffer + dosya boyutu > 64 MiB ise
+         uyari (kabul edilen risk).
+
+---------------------------------------------------------------------------
+ORTA
+---------------------------------------------------------------------------
+
+[3] ORTA - scrypt DoS ust siniri MAX_KDF_N=2^20: ~1 GiB bellek + saniyeler CPU
+    >>> FIX UYGULANDI (DENETIM TURU 3): MAX_KDF_N 1<<20 -> 1<<19 (512 MiB, <<<
+    >>> ~2s). Arastirma: OWASP min N=2^17 (default'umuz TAM OWASP - dokunulmadi), <<<
+    >>> libsodium SENSITIVE=2^20/1GiB yalnizca GUVENILIR (kendi sectigin) girdi <<<
+    >>> icin; saldirgan kontrolundeki header icin RFC 7914 Sec.14 DoS siniri <<<
+    >>> ZORUNLU. 2^19 = 4x default, "sensitive tier" acik kalir. parse_header <<<
+    >>> ve CLI validasyonu otomatik yeni siniri kullaniyor (MAX_KDF_N'e bagli). <<<
+    Yer: hyper_cipher.py satir 69 (MAX_KDF_N = 1 << 20), satir 188
+         (maxmem = 128 * kdf_n * SCRYPT_R * 2 = 2 GiB), parse_header satir
+         402 (2^20 kabul edilir, KDF calistirilmadan once HMAC yok).
+    Senaryo: Saldirgan, kdf_n=2^20 iceren KUCUK bir .hyp dosyasi gonderir
+             (header + bir kac blok = birkac KB). Kurban decrypt_file cagirir;
+             parse_header N=2^20'yi GECERLI bulur (2'nin kuvveti, aralikta).
+             _derive_master -> hashlib.scrypt n=2^20 calisir. Ampirik olcum
+             (2026-08-11, varsayilan r=8 p=1):
+               N=2^17 (varsayilan): 0.38 sn, ~128 MiB
+               N=2^18             : 0.83 sn, ~256 MiB
+               N=2^20 (ekstrapole): ~3.3 sn, ~1 GiB bellek
+             Tek kucuk dosya ile kurbanin makinesi saniyelerce kilitlenir ve
+             1 GiB+ RAM tuketir. KDF'den ONCE hicbir ucuz dogrulama yok
+             (salt/header HMAC'i ancak master turetildikten sonra yapilabilir
+             - mimari kisit, kabul edilebilir; sorun ust SINIRIN cok yuksek
+             olmasi). Onceki rapor [14] bunu kabul edilmis risk saydi; 2^20
+             siniri COK cimert. Gercek guvenlik N=2^18 (~256 MiB) ile bile
+             yeterli (scrypt 2^18 = ~8 milyon SHA256-karar).
+    Fix: MAX_KDF_N'i 2^18'e dusur (256 MiB maxmem, ~0.83 sn) VEYA 2^19'a
+         (512 MiB, ~1.7 sn). KDF sonrasi HMAC dogrulamasi zaten var; bu
+         sinir yalnizca DoS yuzeyini daraltir. Ayrica: decrypt akisina
+         "once header'i HMAC'le dogrula" mumkun degil (key yok) -> kabul
+         edilebilir; sadece ust siniri dusur.
+
+[4] ORTA - hcli.py _guard_output: "kalan gecici dosya" kontrolu OLU KOD
+    >>> FIX UYGULANDI (DENETIM TURU 3): eski "out + '.tmp'" kontrolu >>> 
+    >>> glob.glob(os.path.join(directory, ".hyp-*.tmp")) ile degistirildi. >>> 
+    >>> Artik gercek kalintilar (.hyp-<rastgele>.tmp) yakalaniyor. >>> 
+    >>> test_hcli.py::TestGuardOutput::test_kalan_tmp_reddedilir gercek <<<
+    >>> deseni (.hyp-yarim-kalinti.tmp) kullaniyor. <<<
+    Yer: hcli.py _guard_output() satir 76-80:
+         "if os.path.exists(out + \".tmp\"): ... kalan gecici dosya bulundu"
+    Senaryo: Bu kontrol, eski (v1/v2) deterministik "cikti.hyp.tmp" adini
+             arar. v3'ten itibaren gecici dosyalar tempfile.mkstemp ile
+             ".hyp-<rastgele>.tmp" adiyla uretiliyor (hyper_cipher.py satir
+             802). "out + \".tmp\"" adinda bir dosya HICBIR ZAMAN olusturulmuyor
+             -> bu dal ASLA tetiklenmez. Yani yarim kalmis bir islemin
+             gercek kalintilari (.hyp-*.tmp) encrypt/decrypt ONCESI TESPIT
+             EDILMIYOR; kullanici "onceden var olan gecici dosya" uyarisi
+             yerine hicbir sey alamaz.
+    Fix: Kontrolu gercege uydur: hedef dizinde ".hyp-*" pattern'ini tara
+         (glob.glob(os.path.join(directory, ".hyp-*.tmp"))); varsa uyar.
+         Yalnizca "out + .tmp" degil, tum hip-* kalintilarini yakala.
+
+---------------------------------------------------------------------------
+DUSUK
+---------------------------------------------------------------------------
+
+[5] DUSUK - README test sayisi guncel degil (108+ yaziyor, gercek 111)
+    >>> FIX UYGULANDI (DENETIM TURU 3): README 111 test / 112 (ACL testiyle) <<<
+    >>> olarak guncellendi; KDF araligi "16384..1048576" -> "16384..524288"; <<<
+    >>> .tmp aciklamasi ".hyp-*.tmp + Windows CreateFileW + protected DACL" <<<
+    >>> olarak netlestirildi. Kesin sayi: pytest --collect-only -> 111 (ACL <<<
+    >>> testi eklendikten sonra 112). <<<
+    Yer: README.md satir 192-196 ("82 birim/CLI + 26 profesyonel",
+         "108+ test, hepsi gecer").
+    Senaryo: Gercek: python -m pytest -q -> 111 passed (31.92 sn). README
+             sayilari koddan sapmis (108 vs 111). Dokuman-kod tutarsizligi.
+    Fix: README'yi 111 test / 3 dosya (test_hyper_cipher.py 82, test_hcli.py
+         17, test_professional.py 26 = 125? - dogrula; asil toplam pytest
+         collect = 111) -> kesin sayiyi `python -m pytest --collect-only -q`
+         ile alip README'ye isle. (Not: 82+17+26=125 vs 111 farki, dosyalardan
+         birinde parametrize/tanim farki olabilir - koleksiyon sayisini esas
+         al.)
+
+[6] DUSUK - Proje kokunde demo kalintilari duruyor
+    >>> FIX UYGULANDI (DENETIM TURU 3): ornek_kod.py, ornek_kod.py.hyp, <<<
+    >>> ornek_kod_cozuldu.py -> ornekler/ alt dizinine tasindi (silinmedi). <<<
+    Yer: ornek_kod.py, ornek_kod.py.hyp, ornek_kod_cozuldu.py (proje kokunde)
+    Senaryo: v2 doneminden kalma ornek dosyalar (ornek_kod.py.hyp = sifrelenmis
+             ornek, ornek_kod_cozuldu.py = cozulmus hali). Kullanici kaynak
+             karmasasina yol acabilir; .hyp dosyasi bosuna "sifrelenmis veri"
+             ornegi olarak projede duruyor. (Gizlilik riski yok - ornek kod.)
+    Fix: Sil veya ornekler/ alt dizinine tasi.
+
+[7] BILGI - demo.py passphrase'i stdout'a yazdiriyor
+    >>> FIX UYGULANDI (DENETIM TURU 3): passphrase varsayilan olarak <<<
+    >>> BASILMIYOR; gorsel denetim icin HYPERCIPHER_DEMO_SHOW_PW=1 env <<<
+    >>> bayragiyla gosteriliyor (terminal history/log sizintisi kapandi). <<<
+    Yer: demo.py satir 23: "print(f\"Bu kosuya ozel passphrase (gosterim icin):
+         {PW}\")"
+    Senaryo: Demo amacli bilincli secim (terminal history'sine passphrase
+             dusebilir). Uretim kodu degil; INFO seviyesinde belgelendi.
+    Fix: Gerekmiyor - demo. Istenirse yalnizca --show-pw bayragiyla yazdir.
+
+==============================================================================
+DOGRULANAN SAGLAMLIK (test edildi, sorun yok)
+==============================================================================
+- 112/112 test PASS (21 sn) - birim + CLI + profesyonel takim (ACL testi dahil)
+- hcli.py selftest: portable + donanim-bagli + dosya API roundtrip OK
+- encrypt-then-MAC sirasi, hmac.compare_digest (timing-safe tag karsilastirma)
+- parse_header: version/flag/rotation/kdf_n/salt/nonce uzunluk dogrulamalari
+  (satir 372-409); kdf_n 2'nin kuvveti + aralik kontrolu KDF'den ONCE
+- dosya boyutu cross-check: size == HEADER + data_len + TAG (satir 712)
+- _safe_unlink hata uyarisi (rapor [4] fix'i kismen)
+- wipe(master) + wipe(None) guvenli (satir 415-416)
+- os.replace yalnizca verified=True sonrasi (satir 781-786)
+- flag rezerv bit kontrolu (satir 379), rotation % 64 kontrolu (satir 358)
+- demo.py atexit ile gecici dizin temizligi
+- Windows tmp ACL: yalnizca kullanici (F), kalitim yok (icacls ile dogrulandi)
+- decrypt iki gecis: pass-1'de hicbir dosya acilmaz, tmp yalnizca pass-2'de
+==============================================================================
+OZET: 2 YUKSEK, 2 ORTA, 2 DUSUK, 1 BILGI. Kritik yok.
+DENETIM TURU 3 (2026-08-11): 7/7 bulgu FIXLENDI - 112/112 test PASS +
+selftest OK. Ampirik kanitlar: icacls (yalnizca kullanici (F), kalitim yok),
+iki-gecisli decrypt (pass-1'de hicbir dosya acilmaz), MAX_KDF_N=2^19
+(512 MiB DoS cap), glob ile .hyp-*.tmp kalinti tespiti.
+En acil (fix oncesi): [1] Windows ACL (0600 iddiasi gecersiz) + [2] plaintext
+pre-HMAC write -> ikisi birlikte: cozulmus veri, dogrulama oncesi baska
+kullanicilarin okuyabilecegi bir dosyada yaziliyordu. Ikisi de kapandi:
+plaintext artik dogrulama GECTIKTEN sonra, yalnizca kullaniciya ozel ACL'li
+dosyaya yaziliyor.
+==============================================================================
+DENETIM TURU 4 (2026-08-11): KDF scrypt -> Argon2id (RFC 9106, PHC kazanani)
+UYGULANDI. Kullanici talebi: brute-force'u "cok cok cok cook zor" yap.
+- v3 kullanici sorusu ("1024 bit + cryptography + fernet + secrets?"):
+  gercek kod dogrulandi - KEY_BYTES=256 (2048-bit), ROTATION_BYTES=1024
+  (rotasyon araligi, anahtar boyutu DEGIL), cryptography/fernet kullanilmiyor,
+  secrets yalnizca tmp dosya adinda. Zayif halka: ozel (vetted olmayan)
+  keystream + scrypt KDF.
+- FIX: Argon2id (memory-hard, GPU/ASIC/trade-off direnci scrypt'ten ustun;
+  PHC kazanani, RFC 9106 zorunlu). Parametreler: time=3, lanes=1,
+  memory_cost = kdf_n KiB. Olcum (bu makine): 2^17 (128 MiB) ~0.87s.
+  VERSION 3 -> 4 (format kasti geriye donuk uyumsuz). Header 104 byte
+  DEGISMEDI (kdf_n alani Argon2id memory_cost KiB olarak yorumlanir).
+- GOLDEN vektor Argon2id ile yeniden uretildi (4289 byte, version=4).
+- Dogrulama: 112/112 test PASS + hcli selftest OK. Pyright temiz
+  (hyper_cipher.py, hcli.py). test_professional.py'de yalnizca onceden var
+  olan test-dosyasi tip uyarilari (setUpClass cls.ks), uretim kodu degil.
+- Bagimlilik: v4 icin 'cryptography' paketi gerekli (pip install cryptography);
+  eksikse net SystemExit mesaji verir.
+===============================================================================
+
+===============================================================================
+HYPERCIPHER v5 - ZAAFIYET DENETIM TURU 4 (2026-08-12)
+Konu: Zayif passphrase = TEK GERCEK KIRILMA YOLU -> koken cozum
+Kanit (ampirik): _demo_weak_pw.py - "ankara1234" perdesi, 42 mutasyonla
+  2.49 sn'de kirildi. 2048-bit key uretilse bile perde insan girisi ->
+  goruntulenen guvenlik perde entropisine esittir (L1 acigi, KDF entropi
+  YUKSELTMEZ sadece gergi maliyetini artirir).
+-------------------------------------------------------------------------------
+BULGU [v5-01] YUKSEK - Zayif perde: kutuphane API encrypt() zayif perdeyi
+  sessizce kabul ediyor -> brute-force kisa surede kirar. KOKEN COZUM:
+  3 katman (kullanici onayi + yeni ststests.py/calibrate.py haric tum
+  testler dogrulandi).
+
+FIX [v5-1] Keyfile = ikinci faktor (age/sympa HKDF modeli)
+  - encrypt/decrypt(..., keyfile=b"..."), dosya API'lerinde de var
+  - keyfile >= 32 byte (ValueError), HKDF-SHA256(salt=keyfile,
+    info="HYPR/keyfile/v1") -> 32 byte pre-key -> Argon2id -> 2048-bit
+  - Islem: passphrase'ten Argon2id cagrilmadan ONCE pre-key uretilir;
+    master key ikisi birlikte catilir. Saldirgan zayif perdeyi bilse bile
+    keyfile olmadan HICBIR SEY yapamaz.
+  - FLAG_KEYFILE = 0b0000_0100 yeni header biti (onceki bitler korundu)
+  - decrypt: FLAG set ise keyfile zorunlu (yoksa CipherError); keyfile
+    yoksa HKDF katmani atlanir -> ESKI v4 PAKETLERI GERIYE UYUMLU ACILIR
+  - generate_keyfile(path): os.urandom(64) + O_EXCL + 0600; ustune YAZMAZ
+    (dosya varsa ValueError) - keyfile'i ezmenin geri donusu YOKTUR
+  - read_keyfile(path): [32 byte .. 1 MiB] siniri, asiri buyuk dosya yok
+
+FIX [v5-2] zxcvbn esikli zorunluluk (CLI encrypt)
+  - zxcvbn 4.5.0 kuruldu (benign, satir bazli bagimlilik) - kurulu
+    degilse builtin fallback: uzunluk + sinif + _WEAK_PATTERNS cezasi
+  - check_passphrase_strength(pw) -> (guesses_log10, feedback)
+  - assert_strong_passphrase(pw): guesses_log10 < PASSPHRASE_MIN_GUESSES_LOG10
+    (14.0) ise ValueError (BILINCLI kullanici tercihi, guclu zxcvbn kelime
+    dizisi testlerde dogrulandi)
+  - CLI encrypt: perde zayifsa HATA + exit 1 + tmp kalintisi YOK; --allow-weak
+    acik risk kabulu (sadece script ortamlari icin, README notu var)
+  - decrypt'te SADECE uyari (zaten sifrelenmis dosya zayif perdeyle
+    sifrelenmis olabilir - kullanici kilitlenmemeli) -> exit 0
+  - Kutuphane API'si ZORLAMAZ (eski kod/testler kirilmasin diye); CLI'da
+    zorunlu. test_professional.py'deki API cagrilari kirlilmadi.
+
+FIX [v5-3] Diceware ureteci (generate-passphrase)
+  - EFF large wordlist (7776 kelime, diceware_words.txt) + secrets.choice
+  - 6 kelime ~= 77.5 bit, 5 ~= 64.6, 7 ~= 90.4 (zxcvbn: 133+ bit gorur)
+  - Kelime siniri [3..20]; wordlist dosyasi yoksa 100 kelimelik builtin
+    yedek liste (tekrar olasiligi uyari bilinci - README'de not)
+  - Tekrar eden perde cikarmaz (CSPRNG)
+
+SONUC: 142/142 test PASS (77 hyper_cipher + 38 hcli + 27 professional; onceki
+  hepsi korundu). hcli selftest OK. README v5'e guncellendi. Golden vector
+  DEGISMEDI (keyfile'siz encrypt ciktisi birebir ayni -> geriye uyumlu).
+  Yeni testler: TestKeyfile (10), TestPassphraseStrength (4),
+  TestDiceware (6), TestV5KeyfileCLI (5), TestV5PassphraseCLI (6).
+===============================================================================

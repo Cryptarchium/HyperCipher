@@ -1,0 +1,101 @@
+ZAAFIYET RAPORU V4 (2026-08-13) - GUNCELLEME: 7/7 FIX UYGULANDI
+===============================================================
+Kapsam: Tek basina (agentsiz) tam kod incelemesi.
+  - hyper_cipher.py (1890 satir) - hepsi okundu
+  - hcli.py (532 satir) - hepsi okundu
+  - test_hyper_cipher.py / test_hcli.py / test_professional.py - tarandi
+  (eval/exec/pickle/subprocess-shell deseni YOK; subprocess yalnizca CLI
+   entegrasyon testleri icin, icacls dogrulamasi dahil)
+
+OZET: KRITIK / YUKSEK ACIK BULUNAMADI.
+  Onaylanan guclu noktalar: verify-then-decrypt (2 gecis, [2]),
+  header kdf_n/flag/rotation dogrulamasi KDF ONCESI (DoS cap, [13][14]),
+  CSPRNG salt+nonce (misuse-resistant, IC[10]), Windows protected-DACL
+  tmp+keyfile (killitli SDDL), TOCTOU'suz _open_private_file_read,
+  HMAC compare_digest, tek tarafsiz hata mesaji (oracle kapali),
+  bellek wipe (material), 177 test + pyright temiz.
+
+FIX SONRASI DURUM: 7/7 bulgu duzeltildi (asagida her birine FIXLENDI
+detayi). Yeni tum testler TestV4Fixler (test_hyper_cipher.py, 11 test)
++ test_hcli.py 2 test (F3 uyari/flagsiz) + TestV4FixlerHcli 2 test
+(F1b --allow-weak zorunlulugu) - TDD: once RED (kod degismeden
+basarisiz), sonra GREEN (fix sonrasi gecti). Toplam 177 PASS + 2
+POSIX-skip, pyright 0 hata (kod + test), selftest OK.
+
+1. [ORTA - FIXLENDI] zxcvbn YOKKEN builtin sifre-tahmin edicisi zayif
+   sifreyi "guclu" sayabilir. COZUM (2 katmanli, fail-closed):
+   (a) assert_strong_passphrase artk zxcvbn (_zxcvbn is None) kurulu
+       DEGILSE HER ZAMAN ValueError firlatir - builtin tahmin "yeterli
+       guclu" garantisi veremez, hicbir perde sessizce gecmez. Yol:
+       'pip install zxcvbn' veya 'generate-passphrase' (Diceware) veya
+       bilincli --allow-weak (encrypt yolunu acar, bu fonksiyonu
+       atlayarak).
+   (b) check_passphrase_strength builtin fallback'ine yapisal desen
+       taramasi eklendi (_fallback_pattern_cap): ardisik dizi >=4
+       ("abcd"/"1234" -> 10^8), ayni karakter tekrari >=3 ("aaa" -> 10^6),
+       klavye satirlari TR+EN >=4 bitisik tus ("qwer"/"asdf" -> 10^8),
+       2-karakter donusumu >=6 ("ababab" -> 10^8). Shannon iyimselligi
+       bu desenlerde tavana sabitlenir; rastgele gorunumlu perde
+       (M7#v9Kx2!pQ5@zL4) desensizdir, tahmini degismez.
+   TEST: TestV4Fixler.test_assert_strong_zxcvbn_yoksa_fail_closed,
+   test_fallback_ardisik/tekrar/klavye_cezasi,
+   test_builtin_fallback_rastgele_guclu_kalir.
+
+2. [DUSUK - FIXLENDI] Donanim parmak izi YARI-KAMUSAL bilgidir; ENTROPI
+   degil SAHIPLIK faktorudur. COZUM: collect_hardware_fingerprint
+   docstring'ine acik uyari eklendi (fp asla ekstra entropi sayilmaz,
+   guc passphrase+keyfile'dan gelir); README'ye ayni netlestirme
+   (madde: "Donanim parmak izi ENTROPI DEGILDIR"). TEST: yok (dokuman).
+
+3. [DUSUK - FIXLENDI] FLAG_KEYFILE tasimayan pakete --key-file sessizce
+   yok sayiliyor + keyfile korumali pakette yanlis zayif-perde uyarisi.
+   COZUM (simetrik fail-closed):
+   (a) decrypt() VE decrypt_file(): keyfile verildi ama paket FLAG_KEYFILE
+       TASIMIYORSA -> CipherError ("bu paket keyfile korumali DEGIL -
+       keyfile verilmesi gerekmez"). KDF amplifikasyonu ONCESI net hata.
+       Flag plaintext header'da gorundugu icin oracle degildir.
+   (b) hcli cmd_decrypt: header'dan kf_flag okunur; zayif-perde uyarisi
+       YALNIZCA kf_flag YOKSA basar. Header okunamazsa False varsayilir
+       (decrypt_file zaten hata verir).
+   TEST: TestV4Fixler.test_decrypt_flagsiz_pakete_keyfile_hata,
+   test_decrypt_file_flagsiz_pakete_keyfile_hata,
+   test_hcli: test_keyfile_flagsiz_pakete_keyfile_hata,
+   test_keyfile_paket_zayif_perde_uyarisi_yok.
+
+4. [DUSUK - FIXLENDI] fingerprint_digest() yardimcisi _build_header'daki
+   sha256(salt+fp) mantigini farkli bicimde tekrarlardi (cakisan kod).
+   COZUM: fingerprint_digest(fp_blob=None, salt=b"") ARTIK TEK KAYNAK -
+   _build_header icindeki inline sha256 kaldirildi, fingerprint_digest()
+   cagiriyor. Parametresiz cagrilar (test stabilite, demo.py) hala canli
+   makine parmak izini toplar (geriye uyumlu). Formuller BIRBIRINDEN
+   SAPAMAZ.
+   TEST: TestV4Fixler.test_fingerprint_digest_tek_kaynak (+ mevcut
+   test_parmak_izi_stabil, demo.py canli calisti).
+
+5. [BILGI - FIXLENDI (dokumante)] _guard_output advisory korumadir.
+   COZUM: docstring'e tam analiz eklendi - os.replace symlink'i TAKIP
+   ETMEZ (symlink kendisi degisir), acilis sonrasi S_ISREG dogrulanir,
+   yani hedef CONTENT degistirme/caldirma yolu yoktur; yalnizca teorik
+   denial penceresi vardir. Bilincli tasarim denge olarak korunuyor.
+   TEST: yok (tasarim dogrulamasi).
+
+6. [BILGI - FIXLENDI] Keyfile dogrulamasi yalnizca boyut siniriydi;
+   icerik entropisi olculmuyordu. COZUM: _validate_keyfile'a entropi
+   sanity eklendi (fail-closed): <8 farkli bayt VEYA Shannon entropisi
+   <3.0 bit/bayt -> ValueError ("tahmin edilebilir keyfile ikinci faktor
+   islevsiz - 'generate-keyfile' ile uretin"). bytes(range(64)) ve
+   gercek dunya metin dosyasi (disk keyfile, ~3.4 bit/bayt) esikleri
+   gecer. TEST: TestV4Fixler.test_keyfile_entropi_dusuk_reddedilir,
+   test_keyfile_entropi_yuksek_gecer.
+
+7. [BILGI - FIXLENDI] _hkdf counter tek byte'tir; 16320 byte uzeri cikti
+   tasardi (counter 256+). COZUM: _hkdf basinda RFC 5869 tekil-oktet
+   sinir kontrolu - length <0 VEYA >255*64=16320 -> ValueError (sessiz
+   truncation yok). KEY_BYTES=256 (4 blok) sinirin cok altinda, mevcut
+   cagrilar etkilenmez; gelecekte sabit buyurse cap acik hata verir.
+   TEST: TestV4Fixler.test_hkdf_16320_sinir (16320 OK, 16321 ValueError).
+
+DURUM: 177 test PASS + 2 POSIX-skip, pyright 0 hata (kod + test),
+selftest OK.
+Tum bulgular (1) duzeltildi; 5 gozlem niteligindeydi, kod+dokuman
+hizalandi.

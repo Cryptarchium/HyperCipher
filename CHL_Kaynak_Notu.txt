@@ -1,0 +1,68 @@
+================================================================
+HYPERCIPHER v5 — MAX GÜÇ ŞİFRELEME TÖRENİ NOTU
+================================================================
+Oluşturulma : 2026-10-26
+Kaynak konum: C:\Users\Muhammed Can Topal\Desktop\HyperCipher\
+Hedef konum : C:\Users\Muhammed Can Topal\OneDrive\Masaüstü\CHL\
+
+Bu dosya, HyperCipher v5'in "en yüksek + en güçlü" konfigürasyonu
+ile şifrelenmek üzere üretilmiş bir deneme belgesidir. Aşağıda hem
+şifreleme parametreleri hem de bu paketin neden bu ayarlarla
+üretildiği yazılıdır.
+
+----------------------------------------------------------------
+1) KULLANILAN KONFİGÜRASYON (MAKSİMUM)
+----------------------------------------------------------------
+KDF               : Argon2id, memory_cost = 262144 KiB (2^18, 256 MiB)
+                    time_cost = 3, lanes = 1  -> üst sınır
+Rotation          : 64 byte  -> minimum aralık = MAKSİMUM subkey sayısı
+                    (her 64 byte veride yeni 2048-bit subkey)
+İkinci faktör     : 256 byte keyfile (2048 bit) — FLAG_KEYFILE set
+Donanım bağı      : AÇIK (portable DEĞİL) — yalnızca bu makinede açılır
+Passphrase        : 7 kelimelik Diceware (EFF 7776) ≈ 90.4 bit entropi
+Padding           : ISO 7816-4, blok 65536 byte (maksimum) — dosya boyutu
+                    ciphertext uzunluğundan okunamaz
+Bütünlük          : HMAC-SHA512 (Encrypt-then-MAC), 64 byte tag
+Keystream         : BLAKE2b-512 XOR HMAC-SHA512 (çift hash ailesi)
+Master key        : 2048 bit, hiçbir yerde saklanmaz, her açılışta
+                    passphrase + keyfile + canlı donanım parmak izinden
+                    yeniden türetilir
+
+----------------------------------------------------------------
+2) NEDEN BU AYARLAR
+----------------------------------------------------------------
+- Argon2id 2^18 KiB: RFC 9106 / PHC kazananı; GPU/ASIC/trade-off
+  direnci en yüksek parola KDF'si. Üst sınır, saldırganın her deneme
+  için 256 MiB bellek + ~1 saniye CPU harcamasını zorunlu kılar.
+- 64 byte rotasyon: paket içinde en fazla sayıda bağımsız 2048-bit
+  alt anahtar üretir. Alt anahtarlar birbirine zincirlidir
+  (subkey_i = HKDF(master, nonce, LE64(i) || subkey_{i-1})).
+- 256 byte keyfile: master anahtar boyutuyla (2048 bit) eşleşen
+  ikinci faktör. Perde ele geçse bile keyfile olmadan paket açılmaz;
+  tersi de geçerlidir (keyfile zorunluluğu simetriktir).
+- Donanıma bağlama: MachineGuid + MAC + volume serial + CPU +
+  hostname canlı olarak okunur. Paket başka bir makinede
+  çözülemez — çalınan dosya tek başına işe yaramaz.
+- 65536 byte padding: ciphertext uzunluğu her zaman 64 KiB'ın katı
+  olur; "bu dosya 2 KB'lık bir not" bilgisi sızmaz.
+
+----------------------------------------------------------------
+3) DÜRÜSTLÜK NOTU (README'den)
+----------------------------------------------------------------
+Bu bir öğrenme/mühendislik projesidir. Kriptografik gücün kaynağı
+passphrase + keyfile'dır; donanım parmak izi bir ENTROPİ kaynağı
+değil, yalnızca sahiplik faktörüdür. Rotasyon hızı güvenlik eklemez;
+güvenlik = master anahtarın entropisi. Gerçek üretim sırları için
+AES-256-GCM / ChaCha20-Poly1305 tercih edilmelidir.
+
+----------------------------------------------------------------
+4) DOĞRULAMA
+----------------------------------------------------------------
+Bu belgenin şifrelenmiş hali çözüldüğünde byte-by-byte aynı içerik
+ve aynı SHA-256 özeti elde edilmelidir. Herhangi bir bit değişirse
+HMAC-SHA512 doğrulaması başarısız olur ve çözme işlemi REDDEDİLİR
+(kısmi/bozuk plaintext asla diske düşmez).
+
+================================================================
+SON — HyperCipher v5 / 2048-bit / hardware-bound / keyfile / 256 MiB
+================================================================

@@ -1,0 +1,353 @@
+==============================================================================
+HYPERCIPHER v2 - ZAAFIYET RAPORU (NUMARALI)
+Tarih: 2026-08-10
+Kaynak: 5 bagimsiz audit raporu (crypto core, dosya/stream API, CLI/demo,
+        test kapsami+istatistik, best-practice dis arastirma) + derinlemesine
+        satir-satir inceleme.
+Durum: Bulgu -> En guclu fix onerisi. Uygulananlar isaretlenecek.
+==============================================================================
+
+----------------------------------------------------------------------------
+KRITIK / YUKSEK
+----------------------------------------------------------------------------
+
+[1] KRITIK - Ongorulebilir .tmp dosya adi + symlink/junction saldirisi
+    Yer: hyper_cipher.py encrypt_file()/decrypt_file() -> tmp_path = out + ".tmp"
+    Senaryo: Saldirgan hedef dizine onceden "cikti.hyp.tmp" adinda bir symlink
+             (Windows'ta junction) veya hardlink yerlestirir. open(tmp, "wb")
+             symlink'i TAKIP EDER: (a) encrypt'te rastgele bir dosyanin uzerine
+             ciphertext yazilir/icindekiler yok edilir; (b) decrypt'te cozulen
+             PLAINTEXT saldirganin sectigi yola yazilir (gizlilik felaketi).
+             Ayrica .tmp adi tahmin edilebilir oldugu icin ayri bir surec
+             yarim-islem kalintisini veya baska bir kullanicinin dosyasini
+             sessizce ezer.
+    Fix: tempfile.mkstemp(dir=<hedef dizin>) -> O_EXCL + rastgele isim + 0600
+         izin; acilan fd uzerinden yaz; fsync; os.replace. O_NOFOLLOW ek
+         koruma. .tmp adini HICBIR ZAMAN deterministik yapma.
+
+[2] KRITIK - tmp_path == in_path cakismasi kaynak dosyayi yok eder
+    Yer: hyper_cipher.py encrypt_file()/decrypt_file()
+    Senaryo: in_path == out_path + ".tmp" ise (ornek: "rapor.txt.tmp" girdi,
+             "rapor.txt" cikti) ayni dosya once okuma sonra yazma modunda
+             acilir -> girdi dosyasinin icerigi truncate edilir/yok olur.
+    Fix: islem basinda os.path.samefile / abspath karsilastirmasi ile
+         in_path != tmp_path ve in_path != out_path garantile; cakisma ise
+         ValueError.
+
+[3] YUKSEK - TOCTOU: getsize ile open arasinda dosya degisebilir
+    Yer: hyper_cipher.py encrypt_file() satir ~401 (os.path.getsize ONCE,
+         open SONRA); decrypt_file() satir ~441 ayni desen.
+    Senaryo: getSize -> dosya buyur/kuculur/degisirse header'daki data_len
+             yanlis olur; encrypt done != data_len olur ama KONTROL YOK,
+             uretilen paket cozulemez (availability). /proc gibi sifir boyut
+             gorunen dosyalarda header data_len=0 ama icerik dolu -> bozuk.
+    Fix: ONCE open, SONRA fstat(fin.fileno()).st_size veya fin.seek(0,2)
+         ile boyut al; okuma dongusu bitince done == data_len kontrol et
+         (eslesmiyorsa hata + tmp temizle).
+
+[4] YUKSEK - Plaintext, dogrulama ONCESI varsayilan izinlerle diske yaziliyor
+    Yer: hyper_cipher.py decrypt_file() -> open(tmp_path, "wb")
+    Senaryo: Cozulen plaintext, HMAC dogrulanmadan once "wb" ile acilan
+             dosyaya yazilir; Windows'ta miras alinan ACL / POSIX'te
+             0666&~umask (genelde 0644) -> ayni makinedeki diger kullanicilar
+             plaintext'i okuyabilir. _safe_unlink() basarisiz olursa (dosya
+             kilitli) kalinti DURUMDA kalir ve sessizce yutulur.
+    Fix: mkstemp 0600 (bkz. [1]); _safe_unlink hata durumunda en azindan
+         uyari/stderr log; Windows'ta FILE_FLAG_DELETE_ON_CLOSE dusun.
+
+[5] YUKSEK - KDF girdi materyali (passphrase+fp) bellekten sifirlanmiyor
+    Yer: hyper_cipher.py _derive_master() -> material = passphrase.encode()
+         + b"\x00" + fp_blob (immutable bytes, GC'ye birakiliyor)
+    Senaryo: master/auth_key bytearray olarak wipe ediliyor ama KDF GIRDIsi
+             (passphrase'i iceren bytes) ve ara concatenation'lar
+             (subkey prefix, keystream blok girdileri) heap'te kaliyor.
+             Bellek dump'i alan saldirgan passphrase materyalini bulabilir.
+    Fix: material'i bytearray yap, pbkdf2_hmac cagrisindan SONRA wipe;
+         passphrase encode sonucu bytearray + wipe; hcli'de pw str'sini
+         kullanim sonrasi del (Python'da tam silme mumkun degil ama yasam
+         suresi kisaltilir).
+
+[6] YUKSEK - fp uyumsuzlugu ORACLE'i + timing yan kanali
+    Yer: hyper_cipher.py decrypt()/decrypt_file(): fp_hash karsilastirmasi
+         PBKDF2'den ONCE ve AYRI hata mesaji ("donanim parmak izi uyusmuyor"
+         vs "dogrulama basarisiz").
+    Senaryo: (a) fp uyusmazsa PBKDF2 HIC calismaz (aninda hata), uyusursa
+             calisir (yavas) -> zamanlama farki makine kimligi dogrulama
+             oracle'i; (b) hata mesajlari ayirt edilebilir -> saldirgan
+             paketin hangi makineye ait oldugunu ucuza test eder.
+    Fix: fp karsilastirmasini HMAC dogrulamasindan SONRA yap (fp_hash zaten
+         MAC kapsaminda) ve hata mesajlarini TEK genel mesaja indir.
+
+[7] YUKSEK - CLI: non-tty getpass fallback'inde passphrase EKRANDA gorunur
+    Yer: hcli.py _prompt_passphrase() -> getpass.getpass()
+    Senaryo: stdin pipe/yonlendirme ise Windows'ta fallback_getpass devreye
+             girer: passphrase stdin'den DUZ METIN okunur, ekranda gorunur,
+             shell history / log / pipe kaydina gecer. echo "sifre" |
+             python hcli.py encrypt ... kalibi bunu tesvik eder.
+    Fix: sys.stdin.isatty() degilse passphrase istemini REDDET (fail-closed);
+         otomasyon icin acik secimli --passphrase-file (0600) destegi.
+
+[8] YUKSEK - `hash` komutu anahtar materyalinin YARISINI (fp) düz yazdirir
+    Yer: hcli.py cmd_hash()
+    Senaryo: MachineGuid, MAC adresleri, volume serial, CPU, hostname +
+             SHA-256 -> ekran/log/screenshot'a dusen cikti, master key
+             turetiminin ikinci faktorunu ifsa eder. Calinan .hyp + bu cikti
+             -> sadece passphrase'e kalan cevrimdisi saldiri.
+    Fix: Varsayilan cikti SADECE SHA-256 ozeti + "hassas" uyarisi; tam
+         bilesenler --full bayragi arkasina.
+
+[9] YUKSEK - os.replace oncesi fsync yok -> guc kaybinda bozuk cikti
+    Yer: hyper_cipher.py encrypt_file()/decrypt_file() -> os.replace
+    Senaryo: rename ATOMIC ama data durability garantisi yok: guc kesilirse
+             hedef ad var ama icerik bos/yarim olabilir.
+    Fix: kapatmadan once fout.flush(); os.fsync(fout.fileno()); POSIX'te
+         dizin handle'ini da fsync'le.
+
+[10] YUKSEK - Cihaz/FIFO/ozel dosya girdisi -> sonsuz dongu / blok / disk DoS
+    Yer: hyper_cipher.py encrypt_file() -> os.path.getsize + read(CHUNK) dongusu
+    Senaryo: /dev/urandom girerse EOF gelmez -> sonsuz dongu, disk doldurma;
+             FIFO girerse open bloklanir; /proc dosyalarinda getsize=0 ama
+             icerik dolu -> bozuk paket.
+    Fix: open sonrasi stat ile stat.S_ISREG kontrolu; degilse ValueError.
+
+----------------------------------------------------------------------------
+ORTA
+----------------------------------------------------------------------------
+
+[11] ORTA - Keystream ailesi b: SHA-512 secret-prefix (kanitli PRF degil)
+    Yer: hyper_cipher.py _keystream_block() -> hashlib.sha512(subkey+ctr+b"HYPR2")
+    Senaryo: H(secret||msg) Merkle-Damgard'da kanitli PRF DEGILDIR (length
+             extension teorisi). Dogrudan istismar yok (BLAKE2b keyed ailesi
+             XOR'u kurtariyor) ama yapisal olarak zayif halka.
+    Fix: Iki aile de keyed BLAKE2b olsun (key=subkey[:64]) veya HMAC-SHA512;
+         sabit suffix yerine baglam etiketi ekle.
+
+[12] ORTA - Nonce/salt API ayagi: cagiran sabit salt+nonce verirse keystream
+             tekrari (XOR felaketi)
+    Yer: hyper_cipher.py encrypt()/encrypt_file() salt/nonce parametreleri
+    Senaryo: Ayni (passphrase, salt, nonce) ile iki encrypt -> AYNI keystream
+             -> C1 xor C2 = P1 xor P2 (iki kere kullanilmis pad). API test
+             icin bunu acik birakiyor; yanlis kullanim sessizce felakettir.
+    Fix: Dokumantasyona guclu uyari + nonce'u 16'dan 24 byte'a cikar
+         (XChaCha tarzi random-nonce guvenligi); en kotu durumda cagiran
+         tarafin (salt,nonce) tekrarini tespit icin debug assert.
+
+[13] ORTA - PBKDF2 600K GPU-dostu; bellek sertlestirmesi yok
+    Yer: hyper_cipher.py ITERATIONS=600_000, _derive_master()
+    Senaryo: PBKDF2 GPU/ASIC'de paralel; dusuk entropili passphrase'ler icin
+             Argon2id kadar guclu degil. OWASP 2023: FIPS ortaminda PBKDF2-
+             HMAC-SHA512 icin ~210K-600K kabul edilebilir ama Argon2id
+             oncelikli.
+    Fix: (a) argon2-cffi ile Argon2id (m=64MiB,t=3,p=4 sinif); (b) stdlib
+         kalmak isteniyorsa hashlib.scrypt(N=2^17,r=8,p=1) memory-hard
+         alternatif. Format: KDF parametreleri header'a gomulmeli (halihazir
+         iterations var; argon2 m/t/p eklenmeli).
+
+[14] ORTA - KDF parametreleri saldirgan kontrolunde (on-dogrulama CPU DoS)
+    Yer: parse_header() -> iterations 1000..10M kabul; decrypt PBKDF2'yi MAC
+         oncesi calistiriyor.
+    Senaryo: Saldirgan iterations=10M + gecerli gorunen header gonderir ->
+             kurban ~16x KDF maliyeti yakar (10M iter ~8s), MAC hatali cikar.
+             Kucuk paket -> buyuk CPU amplifikasyonu.
+    Fix: (a) Envelope (age tarzi): rastgele dosya anahtari -> KDF maliyeti
+         tek; (b) pratik: MAX_ITERATIONS'u makul ust sinirla (2x yerel
+         yapilandirma) ve/fp-MAC sirasini [6] gibi iyilestir.
+
+[15] ORTA - Anahtar ayrimi raw concatenation (SP 800-108 uyumsuz)
+    Yer: auth_key = SHA-512(master + b"AUTH"); subkey = SHA-512(prev+master+...)
+    Senaryo: Uzunluk on ekli domain separation yok; kanitli KDF yerine ad hoc
+             sabit suffixler. Pratik istismar yok ama standarda uyumlu
+             degil ve ilerideki degisikliklerde ayrim hatalarina acik.
+    Fix: HKDF-SHA512 (stdlib'de hmac ile kolay): subkey = HKDF(master,
+         salt=nonce, info="HYPR/subkey/"+rot); auth = HKDF(master,
+         info="HYPR/auth"). Label'lar SP 800-108 formatinda.
+
+[16] ORTA - parse_header rezerve flag bitlerini REDDETMIYOR
+    Yer: hyper_cipher.py parse_header() -> flags = header[1]
+    Senaryo: Tanimsiz flag bitleri (bit1..7) sessizce kabul ediliyor; ileride
+             guvenlikle ilgili bir bit tanimlanirsa eski surum bunu yok
+             sayar (fail-open).
+    Fix: flags & ~FLAG_HARDWARE != 0 ise CipherError.
+
+[17] ORTA - rotation_bytes 64'un kati degilse subkey takvimi kayar
+    Yer: _CipherState.process(): rot = offset // rotation_bytes ama bloklar
+         64 byte; or. rotation=65 -> subkey degisimi nominal sinirdan sapar
+         (128/64/128... byte'larda).
+    Senaryo: Dokumante edilen "her ROTATION_BYTES byte'da taze subkey"
+             ozelligi 64-un-kati olmayan degerlerde IHLAL edilir. Encrypt/
+             decrypt tutarli (roundtrip bozulmaz) ama guvenlik iddiasi
+             nominalden farkli.
+    Fix: _validate_params'te rotation_bytes % 64 == 0 zorunlu kil (64, 128,
+         1024, 65504 gibi), veya rotasyon kontrolunu blok sinirina gore
+         duzelt ve dokumante et.
+
+[18] ORTA - data_len (düz metin uzunlugu) header'da acik
+    Yer: Header offset 88
+    Senaryo: Paketin tam boyutu plaintext boyutunu birebir ifsa eder
+             (TLS 1.3 padding / libsodium sodium_pad kavrami). Dosya
+             sifrelemede yaygin kabul ama kisa mesajlarda meta-veri.
+    Fix: Kabul edilen tradeoff olarak dokumante et; opsiyonel padding
+         parametresi ekle (sodium_pad benzeri).
+
+[19] ORTA - fp_hash her dosyada makine kimligi ozeti -> gizlilik/izleme
+    Yer: Header offset 56-88; fingerprint_digest()
+    Senaryo: SHA-256(MachineGuid+MAC+vol+CPU+hostname) her pakette ayni ->
+             calinan dosyalar arasi korelasyon, makine atfetme (bkz. [6]).
+    Fix: fp_hash'i dogrudan degil, dosyaya ozel tuzla hashle veya en azindan
+         raporda gizlilik etkisini dokumante et.
+
+[20] ORTA - Passphrase Unicode normalizasyonu yok (NFC)
+    Yer: _derive_master() passphrase.encode("utf-8")
+    Senaryo: Ayni gorunen passphrase farkli normalizasyon formunda (NFC/NFD)
+             yazilirsa FARKLI key -> kilitli kalma. NIST SP 800-63B onerir.
+    Fix: encode oncesi unicodedata.normalize("NFC", passphrase).
+
+[21] ORTA - CLI exit kodu tutarsizliklari
+    Yer: hcli.py: eksik girdi dosyasi -> 1 (dokumana gore kullanim hatasi 2
+         olmali); Ctrl+C passphrase'te -> 1, islem sirasinda -> 130;
+         yakalanmayan ValueError/UnicodeEncodeError -> traceback + 1.
+    Fix: Tek noktadan exit kodu yonetimi; kullanim hatasi -> 2, iptal -> 130,
+         beklenmeyen -> temiz mesaj + 1.
+
+[22] ORTA - Progress/istatistik ciktisi düz metin boyutu ifsa ediyor
+    Yer: hcli.py _progress(), cmd_encrypt/cmd_decrypt istatistikleri
+    Senaryo: Terminal/log/screencast yakalayan, sifrelenen ve cozulen
+             dosyalarin boyutunu + hizini ogrenir; yonlendirmede \r satirlari
+             loglari doldurur.
+    Fix: progress SADECE stdout.isatty() ise; --quiet/--no-progress bayragi;
+         istatistikler --verbose arkasinda.
+
+[23] ORTA - decrypt cikti varsayilani bug'lari
+    Yer: hcli.py cmd_decrypt(): args.file.endswith(".hyp") case-sensitive;
+         "x.hyp" (4 karakter) -> out = "" (bos string) hata.
+    Fix: case-insensitive kontrol + len > 4 guard + .dec kalinti politikasi.
+
+[24] ORTA - Yonlendirilmis stdout'ta UnicodeEncodeError traceback
+    Yer: hcli.py print() cagrilari (dosya adlari)
+    Senaryo: Pipe/yonlendirme varsa stdout konsol kod sayfasi kullanir;
+             Turkce/emoji dosya adi -> traceback + veri kaybı.
+    Fix: main() basinda sys.stdout.reconfigure(encoding="utf-8",
+         errors="backslashreplace").
+
+[25] ORTA - selftest yalnizca portable yolu test ediyor
+    Yer: hcli.py cmd_selftest() use_hardware=False
+    Senaryo: "SELF-TEST GECTI" mesaji donanim-bagli yol (fp toplama, fp_hash,
+             dosya API, atomic tmp) hic test edilmeden guven verir.
+    Fix: selftest'e donanim-bagli roundtrip + gecici dosya ile encrypt_file/
+         decrypt_file roundtrip ekle.
+
+[26] ORTA - Kutuphane bos/whitespace passphrase kabul ediyor
+    Yer: hyper_cipher.py encrypt()/encrypt_file() (CLI reddediyor ama API acik)
+    Senaryo: encode("") ile sifreleme -> zayif key; API kullanan kod yanlislikla
+             bos passphrase ile sifreler, koruma yokmus gibi.
+    Fix: Kutuphane seviyesinde bos/whitespace passphrase -> ValueError;
+         uzunluk ust siniri (4096) ekle.
+
+----------------------------------------------------------------------------
+DUSUK / INFO
+----------------------------------------------------------------------------
+
+[27] DUSUK - block_idx / rotation_index struct.pack("<Q") tasmasi
+    Yer: _keystream_block(), _derive_subkey()
+    Senaryo: 2^64 blok (2^70 byte ~ 1 ZiB) veya 2^64 rotasyon -> struct.error
+             (sessiz sarim yerine crash). Pratikte ulasilmaz.
+    Fix: DUSUK oncelik - kontrol eklenebilir ama gerekli degil.
+
+[28] DUSUK - progress callback istisnasi tum islemi iptal eder
+    Yer: encrypt_file()/decrypt_file() progress(done,total) cagrisi
+    Senaryo: Hatali bir UI callback'i sifreleme/cozmeyi durdurur (tmp
+             temizlenir, dogru davranis) ama kullanici hatasi -> islem kaybi.
+    Fix: hcli prog() icinde try/except Exception + log.
+
+[29] DUSUK - Bos dosyada progress hic cagrilmiyor
+    Yer: encrypt_file() donguye girmeden bitiyor
+    Fix: progress(done=0, total=0) veya en azindan dokumante et.
+
+[30] DUSUK - test izolasyonu: sabit CWD-goreli dosya adlari
+    Yer: test_hyper_cipher.py, test_professional.py (_test_in.bin, _at_*.bin)
+    Senaryo: Paralel/pes pese kosan test surecleri cakisan adlarla birbirini
+             ezer; proses kill edilirse kalinti kalir.
+    Fix: tempfile.mkdtemp/TemporaryDirectory (test_hcli.py zaten dogru).
+
+[31] DUSUK - Altin vektor cok kisa (~50 byte) - rotasyon zinciri pinlenmiyor
+    Yer: test_professional.py GOLDEN
+    Senaryo: Golden yalnizca rot 0 / blok 0'i kapsar; subkey zinciri (rot>0)
+             ve blok sayaci kodunda regresyon yakalanmaz.
+    Fix: GOLDEN_DATA'yi 4096+ byte'a cikar (2+ rotasyon, cok blok), hex'i
+         yeniden uret.
+
+[32] DUSUK - test_aes_calibration ~%9.6 flaky (rastgele girdi + 10 test)
+    Yer: test_professional.py -> os.urandom key/nonce
+    Senaryo: Her kosturuda rastgele AES keystream; 10 p-degeri x alpha 0.01
+             -> P(en az 1 yanlis fail) ~ 1-0.99^10 ~ %9.6.
+    Fix: Sabit test key/nonce kullan (deterministik) veya <=2 fail kuralini
+         buraya da uygula.
+
+[33] DUSUK - Eksik testler
+    - Rezerve flag bitli paket REDDEDILMELI (sadece encoder tarafi testli)
+    - Pakete sona eklenen fazlalik byte'lar reddedilmeli
+    - fp uyumsuzlugu mock (farkli makine simulasyonu)
+    - use_hardware=True ile dosya API roundtrip
+    - nonce her cagrida taze mi (tam govde ciphertext farkliligi)
+    - parse_header sinirlari: iterations 0/999/1000/10M+1
+    - decrypt_file progress callback
+    - ASCII olmayan passphrase roundtrip
+    - Encrypt/decrypt concurrency ayni out_path (cakisma)
+
+[34] DUSUK - demo.py: sabit public passphrase + sessiz uzerine yazma
+    Yer: demo.py PW sabiti, ornek.txt uzerine yazma
+    Senaryo: (a) Kill/sigkill durumunda atexit calismaz, "ornek.txt.hyp"
+             PUBLIC passphrase ile kalir -> ayni makinede herkes cozer;
+             (b) demo, mevcut ornek.txt/x.txt dosyalarini uyarisiz ezer ve
+             kapatirken SİLER (CLI --force felsefesiyle celiski).
+    Fix: tempfile.mkdtemp icinde calis + tek seferlik random passphrase uret;
+         if __name__ == "__main__" sarmali.
+
+[35] DUSUK - Eslikli encrypt ayni out_path -> ortak .tmp bozulmasi
+    Yer: encrypt_file() (mkstemp fix'i [1] bunu da cozer)
+
+[36] INFO - "MAGIC YOK" tasarimi Kerckhoffs acisindan kozmetik
+    Not: Ciphertext her halukarda random gorunumlu; magic gizlemek hangi
+         arac oldugunu gizler, sifrelendigini degil. Avantaj: format
+         kendiliginden taninmaz. Dezavantaj: arac destegi/versioning zor.
+         Kullanici istegi oldugu icin korunuyor; raporda tradeoff notu.
+
+[37] INFO - Subkey'ler (immutable bytes) wipe edilemiyor
+    Yer: _CipherState.cur_sub, _derive_subkey ciktilari
+    Not: Python bytes immutabledir; yalnizca master/auth_key wipe edilebilir.
+         [5] ile birlikte bellek hijyeni iyilestirilir ama tamamlanamaz.
+         Dokumente et.
+
+==============================================================================
+ONCELIKLENDIRME (UYGULAMA SIRASI)
+==============================================================================
+UYGULA (kritik/yuksek):
+  [1] mkstemp + 0600 + O_EXCL -> [2] in/tmp cakisma guard -> [3] TOCTOU fix
+  -> [4] izinler + unlink log -> [5] KDF material wipe -> [6] fp sonrasi MAC
+  + tek mesaj -> [9] fsync -> [10] S_ISREG -> [16] rezerve flag reddi
+  -> [17] rotation %64 -> [26] kutuphane bos passphrase reddi -> [20] NFC
+  -> [7][8][21][22][23][24][25] hcli iyilestirmeleri
+ARASTIR + UYGULA (orta):
+  [11] keyed BLAKE2b/HMAC aileler -> [12] nonce 24 byte + uyari
+  -> [13] scrypt/Argon2 -> [14] KDF DoS siniri -> [15] HKDF label'lar
+  -> [18] padding opsiyonu -> [19] fp_hash tuzlama -> [31][32][33] testler
+DEĞERLENDIR (dusuk/info): [27][28][29][30][34][35][36][37]
+==============================================================================
+
+DURUM (2026-08-11): TUM MADDELER TAMAMLANDI — 111/111 test PASS + selftest.
+  [31] Golden vector 4121 byte'a buyutuldu (4+ rotasyon zinciri pinlenir)
+  [32] AES kalibrasyon deterministik (sabit key/nonce, flaky %9.6 gitti)
+  [33] Eksik testler eklendi: sona fazlalik byte reddi, use_hardware=True
+       dosya roundtrip, decrypt_file progress callback
+  [28] hcli prog() try/except (hatali UI callback islemi iptal etmez)
+  [29] Bos dosya/paket: progress(0,0) artik cagrilir (encrypt+decrypt)
+  [34] demo.py: tempdir + tek seferlik random passphrase + __main__ sarmali
+  [30] Test izolasyonu: tum dosya testleri tempfile.mkdtemp dizininde
+       (TestStreamAPI/TestCrossAPI/TestAtomicity setUp/tearDown)
+  [27][36][37] README'ye dokumante edildi (struct.pack siniri, MAGIC-YOK
+       tradeoff, immutable subkey wipe siniri)
+  [35] [1] mkstemp fix'i ile zaten cozulmustu
+  Ek: Pyright temizligi — wipe() None-safe (auth_key turetim hatasinda
+       NameError maskelenmesi onlendi), bytearray/bytes tip uyusmazliklari,
+       hcli reconfigure getattr. README v3'e tamamen guncellendi.
+==============================================================================
